@@ -197,6 +197,9 @@ def test_forward_constituency_composition(pt):
     model = build_model(pt, '--constituency_composition', 'bilstm_max')
     run_forward_checks(model, num_states=2)
 
+    model = build_model(pt, '--constituency_composition', 'tree_lstm')
+    run_forward_checks(model)
+
     model = build_model(pt, '--constituency_composition', 'bigram')
     run_forward_checks(model, num_states=2)
 
@@ -230,3 +233,10 @@ def test_forward_timing_choices(pt):
     model = build_model(pt, '--pattn_num_heads', '4', '--pattn_num_layers', '4', '--pattn_timing', 'learned')
     run_forward_checks(model)
 
+def test_lstm_tree_forward(pt):
+    model = build_model(pt, '--num_tree_lstm_layers', '1', '--constituency_composition', 'tree_lstm')
+    run_forward_checks(model)
+    model = build_model(pt, '--num_tree_lstm_layers', '2', '--constituency_composition', 'tree_lstm')
+    run_forward_checks(model)
+    model = build_model(pt, '--num_tree_lstm_layers', '3', '--constituency_composition', 'tree_lstm')
+    run_forward_checks(model)
