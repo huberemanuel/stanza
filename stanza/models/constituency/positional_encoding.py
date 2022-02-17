@@ -26,7 +26,10 @@ class SinusoidalEncoding(nn.Module):
 
     def forward(self, x):
         if max(x) >= self.pe.shape[0]:
-            self.register_buffer('pe', self.build_position(self.pe.shape[1], max(x)+1, device=self.pe.device))
+            device = self.pe.device
+            shape = self.pe.shape[1]
+            self.register_buffer('pe', None)
+            self.register_buffer('pe', self.build_position(shape, max(x)+1, device=device))
         return self.pe[x]
 
     def max_len(self):
