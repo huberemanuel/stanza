@@ -45,6 +45,7 @@ from stanza.models.constituency.label_attention import LabelAttentionModule
 from stanza.models.constituency.parse_transitions import TransitionScheme
 from stanza.models.constituency.parse_tree import Tree
 from stanza.models.constituency.partitioned_transformer import PartitionedTransformerModule
+from stanza.models.constituency.simple_attention import SimpleAttentionModule
 from stanza.models.constituency.tree_stack import TreeStack
 from stanza.models.constituency.utils import build_nonlinearity, initialize_linear, TextTooLongError
 
@@ -258,6 +259,15 @@ class LSTMModel(BaseModel, nn.Module):
             self.bert_model = None
             self.bert_tokenizer = None
             self.is_phobert = False
+
+        # TODO: make these options
+        self.simple_attn = SimpleAttentionModule(4,
+                                                 8,
+                                                 self.word_input_size,
+                                                 self.word_input_size,
+                                                 128,
+                                                 self.word_input_size // 2)
+        self.word_input_size = self.simple_attn.d_model
 
         self.partitioned_transformer_module = None
         if self.args['pattn_num_heads'] > 0 and self.args['pattn_num_layers'] > 0:
@@ -642,6 +652,11 @@ class LSTMModel(BaseModel, nn.Module):
             if self.sentence_boundary_vectors is SentenceBoundary.NONE:
                 bert_embeddings = [be[1:-1] for be in bert_embeddings]
             all_word_inputs = [torch.cat((x, y), axis=1) for x, y in zip(all_word_inputs, bert_embeddings)]
+
+        if self.simple_attn is not None:
+            # TODO: if this helps, batch the operations
+            attention_results = [self.simple_attn(x.unsqueeze(0)).squeeze(0) for x in all_word_inputs]
+            all_word_inputs = attention_results
 
         # Extract partitioned representation
         if self.partitioned_transformer_module is not None:
