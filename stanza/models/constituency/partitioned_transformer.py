@@ -86,10 +86,13 @@ class PartitionedReLU(nn.ReLU):
 
 
 class PartitionedLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, cross=False):
         super().__init__()
         self.linear_c = nn.Linear(in_features // 2, out_features // 2, bias)
         self.linear_p = nn.Linear(in_features // 2, out_features // 2, bias)
+        self.cross = cross
+        if self.cross:
+            self.linear_cp = nn.Linear(in_features // 2, out_features // 2, bias)
 
     def forward(self, x):
         if isinstance(x, tuple):
@@ -99,6 +102,8 @@ class PartitionedLinear(nn.Module):
 
         out_c = self.linear_c(x_c)
         out_p = self.linear_p(x_p)
+        if self.cross:
+            out_c = out_c + self.linear_cp(x_c)
         return out_c, out_p
 
 
@@ -159,9 +164,9 @@ class PartitionedTransformerEncoderLayer(nn.Module):
         self.self_attn = PartitionedMultiHeadAttention(
             d_model, n_head, d_qkv, attention_dropout=attention_dropout
         )
-        self.linear1 = PartitionedLinear(d_model, d_ff)
+        self.linear1 = PartitionedLinear(d_model, d_ff, cross=True)
         self.ff_dropout = FeatureDropout(ff_dropout)
-        self.linear2 = PartitionedLinear(d_ff, d_model)
+        self.linear2 = PartitionedLinear(d_ff, d_model, cross=True)
 
         self.norm_attn = nn.LayerNorm(d_model)
         self.norm_ff = nn.LayerNorm(d_model)
