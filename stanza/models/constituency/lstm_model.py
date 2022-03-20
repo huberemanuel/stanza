@@ -118,6 +118,27 @@ class ConstituencyComposition(Enum):
     BILSTM_MAX            = 4
     BIGRAM                = 5
 
+
+class MLP(nn.Module):
+    """
+    Simple module: contains N linears and a nonlinearity
+
+    MLP to transform input dimension to output dimension
+    """
+    def __init__(self, in_features, hidden_features, out_features, num_layers, nonlinearity, dropout):
+        super().__init__()
+        self.nonlinearity = nonlinearity
+        self.dropout = dropout
+        layer_sizes = [in_features] + [hidden_features] * (num_layers - 1) + [out_features]
+        self.layers = nn.ModuleList([nn.Linear(input_size, output_size)
+                                     for input_size, output_size in zip(layer_sizes[:-1], layer_sizes[1:])])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = self.dropout(self.nonlinearity(layer(x)))
+        return x
+
+
 class LSTMModel(BaseModel, nn.Module):
     def __init__(self, pretrain, forward_charlm, backward_charlm, bert_model, bert_tokenizer, transitions, constituents, tags, words, rare_words, root_labels, constituent_opens, unary_limit, args):
         """
@@ -297,13 +318,19 @@ class LSTMModel(BaseModel, nn.Module):
                                                                    self.args['lattn_partitioned'])
                 self.word_input_size = self.word_input_size + self.args['lattn_d_proj']*self.args['lattn_d_l']
 
+        self.nonlinearity = build_nonlinearity(self.args['nonlinearity'])
+
+        self.word_dropout = nn.Dropout(self.args['word_dropout'])
+        self.predict_dropout = nn.Dropout(self.args['predict_dropout'])
+        self.lstm_input_dropout = nn.Dropout(self.args['lstm_input_dropout'])
+
         self.word_lstm = nn.LSTM(input_size=self.word_input_size, hidden_size=self.hidden_size, num_layers=self.num_lstm_layers, bidirectional=True, dropout=self.lstm_layer_dropout)
 
         # after putting the word_delta_tag input through the word_lstm, we get back
         # hidden_size * 2 output with the front and back lstms concatenated.
         # this transforms it into hidden_size with the values mixed together
-        self.word_to_constituent = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        initialize_linear(self.word_to_constituent, self.args['nonlinearity'], self.hidden_size * 2)
+        # TODO: initialize_linear
+        self.word_to_constituent = MLP(self.hidden_size * 2, self.hidden_size, self.hidden_size, 2, self.nonlinearity, self.word_dropout)
 
         self.transitions = sorted(list(transitions))
         self.transition_map = { t: i for i, t in enumerate(self.transitions) }
@@ -365,12 +392,6 @@ class LSTMModel(BaseModel, nn.Module):
             initialize_linear(self.reduce_bigram, self.args['nonlinearity'], self.hidden_size)
         else:
             raise ValueError("Unhandled ConstituencyComposition: {}".format(self.constituency_composition))
-
-        self.nonlinearity = build_nonlinearity(self.args['nonlinearity'])
-
-        self.word_dropout = nn.Dropout(self.args['word_dropout'])
-        self.predict_dropout = nn.Dropout(self.args['predict_dropout'])
-        self.lstm_input_dropout = nn.Dropout(self.args['lstm_input_dropout'])
 
         # matrix for predicting the next transition using word/constituent/transition queues
         # word size + constituency size + transition size
@@ -668,7 +689,6 @@ class LSTMModel(BaseModel, nn.Module):
             else:
                 sentence_output = word_output[:len(tagged_words), sentence_idx, :]
             sentence_output = self.word_to_constituent(sentence_output)
-            sentence_output = self.nonlinearity(sentence_output)
             # TODO: this makes it so constituents downstream are
             # build with the outputs of the LSTM, not the word
             # embeddings themselves.  It is possible we want to
