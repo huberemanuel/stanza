@@ -12,6 +12,7 @@ See the `train` method for the code block which starts from
 
 from collections import Counter
 from collections import namedtuple
+from collections import OrderedDict
 import logging
 import random
 import re
@@ -46,9 +47,9 @@ class Trainer:
 
     Not inheriting from common/trainer.py because there's no concept of change_lr (yet?)
     """
-    def __init__(self, args, model, optimizer=None):
+    def __init__(self, args, models, optimizer=None):
         self.args = args
-        self.model = model
+        self.models = models
         self.optimizer = optimizer
 
     def uses_xpos(self):
@@ -58,10 +59,14 @@ class Trainer:
         """
         Save the model (and by default the optimizer) to the given path
         """
-        params = self.model.get_params()
+        # TODO: one liner for this?
+        param_map = OrderedDict()
+        for model_name, model in self.models.items():
+            param_map[model_name] = model.get_params()
+
         checkpoint = {
             'args': self.args,
-            'params': params,
+            'param_map': param_map,
             'model_type': 'LSTM',
         }
         if save_optimizer and self.optimizer is not None:
@@ -89,11 +94,18 @@ class Trainer:
 
         saved_args = dict(checkpoint['args'])
         saved_args.update(args)
-        params = checkpoint['params']
+        bert_model, bert_tokenizer = load_bert(saved_args.get('bert_model', None), foundation_cache)
+
+        if 'param_map' not in checkpoint:
+            param_map = {'default': checkpoint.get('params', checkpoint)}
+        else:
+            param_map = checkpoint['param_map']
 
         model_type = checkpoint['model_type']
-        if model_type == 'LSTM':
-            bert_model, bert_tokenizer = load_bert(saved_args.get('bert_model', None), foundation_cache)
+        if model_type != 'LSTM':
+            raise ValueError("Unknown model type {}".format(model_type))
+        models = OrderedDict()
+        for model_name, params in param_map.items():
             model = LSTMModel(pretrain=pt,
                               forward_charlm=forward_charlm,
                               backward_charlm=backward_charlm,
@@ -108,15 +120,13 @@ class Trainer:
                               constituent_opens=params['constituent_opens'],
                               unary_limit=params['unary_limit'],
                               args=saved_args)
-        else:
-            raise ValueError("Unknown model type {}".format(model_type))
-        model.load_state_dict(params['model'], strict=False)
-
-        if use_gpu:
-            model.cuda()
+            model.load_state_dict(params['model'], strict=False)
+            if use_gpu:
+                model.cuda()
+            models[model_name] = model
 
         if load_optimizer:
-            optimizer = build_optimizer(saved_args, model)
+            optimizer = build_optimizer(saved_args, models)
 
             if checkpoint.get('optimizer_state_dict', None) is not None:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -126,11 +136,14 @@ class Trainer:
             optimizer = None
 
         logger.debug("-- MODEL CONFIG --")
-        for k in model.args.keys():
-            logger.debug("  --%s: %s", k, model.args[k])
+        for k in saved_args.keys():
+            logger.debug("  --%s: %s", k, saved_args[k])
 
-        return Trainer(args=saved_args, model=model, optimizer=optimizer)
+        return Trainer(args=saved_args, models=models, optimizer=optimizer)
 
+    def log_norms():
+        for name, model in self.models.items():
+            model.log_norms("NORMS for {}".format(name))
 
 def load_pretrain(args):
     """
@@ -198,18 +211,16 @@ def evaluate(args, model_file, retag_pipeline):
         backward_charlm = load_charlm(args['charlm_backward_file'])
         trainer = Trainer.load(model_file, pt, forward_charlm, backward_charlm, args['cuda'])
 
-        treebank = tree_reader.read_treebank(args['eval_file'])
-        logger.info("Read %d trees for evaluation", len(treebank))
-
-        if retag_pipeline is not None:
-            logger.info("Retagging trees using the %s tags from the %s package...", args['retag_method'], args['retag_package'])
-            treebank = retag_trees(treebank, retag_pipeline, args['retag_xpos'])
-            logger.info("Retagging finished")
+        treebank = read_treebanks(args['eval_file'], "test", retag_pipeline, args, dedup=False)
 
         if args['log_norms']:
-            trainer.model.log_norms()
-        f1 = run_dev_set(trainer.model, treebank, args, evaluator)
-        logger.info("F1 score on %s: %f", args['eval_file'], f1)
+            trainer.log_norms()
+        for name, trees in treebank.items():
+            if name not in trainer.models:
+                logger.error("No model for %s available", name)
+                continue
+            f1 = run_dev_set(trainer.models.get(name), trees, args, evaluator)
+            logger.info("F1 score on %s: %f", name, f1)
 
 def get_open_nodes(trees, args):
     """
@@ -310,6 +321,7 @@ def build_trainer(args, train_trees, dev_trees, pt, forward_charlm, backward_cha
         logger.info("Loading model to continue training from %s", model_load_file)
         trainer = Trainer.load(model_load_file, pt, forward_charlm, backward_charlm, args['cuda'], args, load_optimizer=True)
     else:
+        # TODO: one model per dataset
         model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, train_transitions, train_constituents, tags, words, rare_words, root_labels, open_nodes, unary_limit, args)
         if args['cuda']:
             model.cuda()
@@ -317,7 +329,8 @@ def build_trainer(args, train_trees, dev_trees, pt, forward_charlm, backward_cha
 
         optimizer = build_optimizer(args, model)
 
-        trainer = Trainer(args, model, optimizer)
+        models = OrderedDict([("default", model)])
+        trainer = Trainer(args, models, optimizer)
 
     return trainer, train_sequences, train_transitions
 
@@ -339,7 +352,7 @@ def remove_duplicates(trees, dataset):
 
 def remove_no_tags(trees):
     """
-    TODO: remove these trees in the conversion instead of here
+    TODO: remove these trees in the treebank original data -> PTB conversion instead of here
     """
     new_trees = [x for x in trees if
                  len(x.children) > 1 or
@@ -348,6 +361,68 @@ def remove_no_tags(trees):
     if len(trees) - len(new_trees) > 0:
         logger.info("Eliminated %d trees with missing structure", (len(trees) - len(new_trees)))
     return new_trees
+
+def process_treebank_descriptions(treebank_descriptions):
+    """
+    Returns a map of schema name to list of filenames
+
+    For now, the only information kept about the treebank is the filename and annotation scheme
+    """
+    treebanks = OrderedDict()
+    first_package = None
+    for td in treebank_descriptions.split(";"):
+        pieces = td.split(",")
+        filename = None
+        package = None
+        for piece in pieces:
+            kv = piece.split("=", maxsplit=1)
+            if len(kv) == 1:
+                key = "filename"
+                value = piece
+            else:
+                key, value = kv
+            if key == 'filename':
+                filename = value
+            elif key == 'package':
+                package = value
+            else:
+                raise ValueError("Unknown key {} in {}".format(key, treebank_descriptions))
+        if package is None:
+            if first_package is None:
+                first_package = "default"
+            package = first_package
+        if first_package is None:
+            first_package = package
+        if filename is None:
+            raise ValueError("Missing filename in {}".format(treebank_descriptions))
+        if package not in treebanks:
+            treebanks[package] = []
+        treebanks[package].append(filename)
+    return treebanks
+
+
+def read_treebanks(treebank_descriptions, data_split, retag_pipeline, args, dedup=True):
+    """
+    data_split: train, dev, test
+    """
+    treebank_descriptions = process_treebank_descriptions(treebank_descriptions)
+    treebanks = OrderedDict()
+    for schema, filenames in treebank_descriptions.items():
+        treebank = []
+        for filename in filenames:
+            trees = tree_reader.read_treebank(filename)
+            logger.info("Read %d trees from %s for the %s %s set", len(trees), filename, schema, data_split)
+            treebank.extend(trees)
+        if dedup:
+            treebank = remove_duplicates(treebank, data_split)
+        treebank = remove_no_tags(treebank)
+
+        if retag_pipeline is not None:
+            logger.info("Retagging %s %s trees using the %s tags from the %s package...", schema, data_split, args['retag_method'], args['retag_package'])
+            treebank = retag_trees(treebank, retag_pipeline, args['retag_xpos'])
+
+        treebanks[schema] = treebank
+    return treebanks
 
 def train(args, model_save_file, model_load_file, model_save_latest_file, retag_pipeline):
     """
@@ -367,20 +442,8 @@ def train(args, model_save_file, model_load_file, model_save_latest_file, retag_
     with EvaluateParser(kbest=kbest) as evaluator:
         utils.ensure_dir(args['save_dir'])
 
-        train_trees = tree_reader.read_treebank(args['train_file'])
-        logger.info("Read %d trees for the training set", len(train_trees))
-        train_trees = remove_duplicates(train_trees, "train")
-        train_trees = remove_no_tags(train_trees)
-
-        dev_trees = tree_reader.read_treebank(args['eval_file'])
-        logger.info("Read %d trees for the dev set", len(dev_trees))
-        dev_trees = remove_duplicates(dev_trees, "dev")
-
-        if retag_pipeline is not None:
-            logger.info("Retagging trees using the %s tags from the %s package...", args['retag_method'], args['retag_package'])
-            train_trees = retag_trees(train_trees, retag_pipeline, args['retag_xpos'])
-            dev_trees = retag_trees(dev_trees, retag_pipeline, args['retag_xpos'])
-            logger.info("Retagging finished")
+        train_trees = read_treebanks(args['train_file'], "train", retag_pipeline, args)
+        dev_trees = read_treebanks(args['eval_file'], "dev", retag_pipeline, args)
 
         pt = load_pretrain(args)
         forward_charlm = load_charlm(args['charlm_forward_file'])
@@ -450,7 +513,7 @@ def iterate_training(trainer, train_trees, train_sequences, transitions, dev_tre
         model.train()
         logger.info("Starting epoch %d", epoch)
         if args['log_norms']:
-            model.log_norms()
+            trainer.log_norms()
         epoch_data = leftover_training_data
         while len(epoch_data) < args['epoch_size']:
             random.shuffle(train_data)
