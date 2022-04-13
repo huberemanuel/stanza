@@ -15,6 +15,9 @@ ARGUMENTS = {
     
 
 def output_subtrees(input_file, output_file, *args):
+    """
+    Use the CoreNLP OutputSubtrees tool to convert the input file to output
+    """
     # TODO: maybe can convert this to use the python tree?
     cmd = ["java", "edu.stanford.nlp.trees.OutputSubtrees", "-input", input_file, "-output", output_file]
     if len(args) > 0:
@@ -23,6 +26,11 @@ def output_subtrees(input_file, output_file, *args):
     subprocess.run(cmd)
 
 def convert_version(dataset, input_dir, output_dir):
+    """
+    Convert the fiveclass files to a specific format
+
+    Uses the ARGUMENTS specific for the format wanted
+    """
     extra_args = ARGUMENTS[dataset]
     for treebank_file in TREEBANK_FILES:
         input_file = os.path.join(input_dir, "fiveclass", treebank_file)
@@ -32,6 +40,9 @@ def convert_version(dataset, input_dir, output_dir):
         output_subtrees(input_file, output_file, *extra_args)
 
 def parse_args():
+    """
+    Actually, the only argument used right now is the formats to convert
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('sections', type=str, nargs='*', help='Which transformations to use: {}'.format(" ".join(ARGUMENTS.keys())))
     args = parser.parse_args()
