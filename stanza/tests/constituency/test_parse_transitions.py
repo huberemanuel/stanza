@@ -1,21 +1,22 @@
 import pytest
 
 from stanza.models.constituency import parse_transitions
-from stanza.models.constituency.base_model import SimpleModel
+from stanza.models.constituency.base_model import SimpleModel, UNARY_LIMIT
 from stanza.models.constituency.parse_transitions import TransitionScheme
 from stanza.tests import *
 
 pytestmark = [pytest.mark.pipeline, pytest.mark.travis]
 
 
-def build_initial_state(model):
+def build_initial_state(model, num_states=1):
     words = ["Unban", "Mox", "Opal"]
     tags = ["VB", "NNP", "NNP"]
+    sentences = [list(zip(words, tags)) for _ in range(num_states)]
 
-    state = parse_transitions.initial_state_from_words([list(zip(words, tags))], model)
-    assert len(state) == 1
-    assert state[0].num_transitions() == 0
-    return state
+    states = parse_transitions.initial_state_from_words(sentences, model)
+    assert len(states) == num_states
+    assert all(state.num_transitions() == 0 for state in states)
+    return states
 
 def test_initial_state(model=None):
     if model is None:
@@ -265,7 +266,7 @@ def test_too_many_unaries_close():
 
     open_np = parse_transitions.OpenConstituent("NP")
     close_trans = parse_transitions.CloseConstituent()
-    for _ in range(parse_transitions.UNARY_LIMIT):
+    for _ in range(UNARY_LIMIT):
         assert open_np.is_legal(state, model)
         state = open_np.apply(state, model)
 
@@ -298,7 +299,7 @@ def test_too_many_unaries_open():
     assert shift.is_legal(state, model)
     state = shift.apply(state, model)
 
-    for _ in range(parse_transitions.UNARY_LIMIT):
+    for _ in range(UNARY_LIMIT):
         assert open_np.is_legal(state, model)
         state = open_np.apply(state, model)
 

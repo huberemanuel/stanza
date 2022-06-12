@@ -284,7 +284,6 @@ def load_conllu(file):
             #     != 1
             # ):
             #     raise UDError("There are multiple roots in a sentence")
-
             # End the sentence
             ud.sentences[-1].end = index
             sentence_start = None

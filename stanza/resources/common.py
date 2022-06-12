@@ -2,15 +2,19 @@
 Common utilities for Stanza resources.
 """
 
-import os
-import requests
-from tqdm.auto import tqdm
-from pathlib import Path
-import json
+from collections import defaultdict, namedtuple
+import errno
 import hashlib
-import zipfile
-import shutil
+import json
 import logging
+import os
+from pathlib import Path
+import requests
+import shutil
+import tempfile
+import zipfile
+
+from tqdm.auto import tqdm
 
 from stanza.utils.helper_func import make_table
 from stanza.pipeline._constants import TOKENIZE, MWT, POS, LEMMA, DEPPARSE, \
@@ -35,36 +39,19 @@ DEFAULT_MODEL_DIR = os.getenv(
     os.path.join(HOME_DIR, 'stanza_resources')
 )
 
+PRETRAIN_NAMES = ("pretrain", "forward_charlm", "backward_charlm")
+
+class ResourcesFileNotFoundError(FileNotFoundError):
+    def __init__(self, resources_filepath):
+        super().__init__(f"Resources file not found at: {resources_filepath}  Try to download the model again.")
+        self.resources_filepath = resources_filepath
+
 class UnknownProcessorError(ValueError):
     def __init__(self, unknown):
         super().__init__(f"Unknown processor type requested: {unknown}")
         self.unknown_processor = unknown
 
-# given a language and models path, build a default configuration
-def build_default_config(resources, lang, model_dir, load_list):
-    default_config = {}
-    for item in load_list:
-        processor, package, dependencies = item
-
-        # handle case when processor variants are used
-        if package in PROCESSOR_VARIANTS[processor]:
-            default_config[f"{processor}_with_{package}"] = True
-        # handle case when identity is specified as lemmatizer
-        elif processor == LEMMA and package == 'identity':
-            default_config[f"{LEMMA}_use_identity"] = True
-        else:
-            default_config[f"{processor}_model_path"] = os.path.join(
-                model_dir, lang, processor, package + '.pt'
-            )
-
-        if not dependencies: continue
-        for dependency in dependencies:
-            dep_processor, dep_model = dependency
-            default_config[f"{processor}_{dep_processor}_path"] = os.path.join(
-                model_dir, lang, dep_processor, dep_model + '.pt'
-            )
-
-    return default_config
+ModelSpecification = namedtuple('ModelSpecification', ['processor', 'package', 'dependencies'])
 
 def ensure_dir(path):
     """
@@ -103,11 +90,16 @@ def file_exists(path, md5):
     """
     return os.path.exists(path) and get_md5(path) == md5
 
-def assert_file_exists(path, md5=None):
-    assert os.path.exists(path), "Could not find file at %s" % path
+def assert_file_exists(path, md5=None, alternate_md5=None):
+    if not os.path.exists(path):
+        raise FileNotFoundError(errno.ENOENT, "Cannot find expected file", path)
     if md5:
         file_md5 = get_md5(path)
-        assert file_md5 == md5, "md5 for %s is %s, expected %s" % (path, file_md5, md5)
+        if file_md5 != md5:
+            if file_md5 == alternate_md5:
+                logger.debug("Found a possibly older version of file %s, md5 %s instead of %s", path, alternate_md5, md5)
+            else:
+                raise ValueError("md5 for %s is %s, expected %s" % (path, file_md5, md5))
 
 def download_file(url, path, proxies, raise_for_status=False):
     """
@@ -130,17 +122,31 @@ def download_file(url, path, proxies, raise_for_status=False):
         r.raise_for_status()
     return r.status_code
 
-def request_file(url, path, proxies=None, md5=None, raise_for_status=False):
+def request_file(url, path, proxies=None, md5=None, raise_for_status=False, log_info=True, alternate_md5=None):
     """
     A complete wrapper over download_file() that also make sure the directory of
     `path` exists, and that a file matching the md5 value does not exist.
+
+    alternate_md5 allows for an alternate md5 that is acceptable (such as if an older version of a file is okay)
     """
-    ensure_dir(Path(path).parent)
+    basedir = Path(path).parent
+    ensure_dir(basedir)
     if file_exists(path, md5):
-        logger.info(f'File exists: {path}.')
+        if log_info:
+            logger.info(f'File exists: {path}')
+        else:
+            logger.debug(f'File exists: {path}')
         return
-    download_file(url, path, proxies, raise_for_status)
-    assert_file_exists(path, md5)
+    # We write data first to a temporary directory,
+    # then use os.replace() so that multiple processes
+    # running at the same time don't clobber each other
+    # with partially downloaded files
+    # This was especially common with resources.json
+    with tempfile.TemporaryDirectory(dir=basedir) as temp:
+        temppath = os.path.join(temp, os.path.split(path)[-1])
+        download_file(url, temppath, proxies, raise_for_status)
+        os.replace(temppath, path)
+    assert_file_exists(path, md5, alternate_md5)
 
 def sort_processors(processor_list):
     sorted_list = []
@@ -148,6 +154,16 @@ def sort_processors(processor_list):
         for item in processor_list:
             if item[0] == processor:
                 sorted_list.append(item)
+    # going just by processors in PIPELINE_NAMES, this drops any names
+    # which are not an official processor but might still be useful
+    # check the list and append them to the end
+    # this is especially useful when downloading pretrain or charlm models
+    for processor in processor_list:
+        for item in sorted_list:
+            if processor[0] == item[0]:
+                break
+        else:
+            sorted_list.append(item)
     return sorted_list
 
 def add_mwt(processors, resources, lang):
@@ -167,53 +183,71 @@ def add_mwt(processors, resources, lang):
         logger.warning("Language %s package %s expects mwt, which has been added", lang, value)
         processors[MWT] = value
 
-def maintain_processor_list(resources, lang, package, processors):
-    processor_list = {}
+def maintain_processor_list(resources, lang, package, processors, allow_pretrain=False):
+    """
+    Given a parsed resources file, language, and possible package
+    and/or processors, expands the package to the list of processors
+
+    Returns a list of processors
+    Each item in the list of processors is a pair:
+      name, then a list of ModelSpecification
+    so, for example:
+      [['pos', [ModelSpecification(processor='pos', package='gsd', dependencies=None)]],
+       ['depparse', [ModelSpecification(processor='depparse', package='gsd', dependencies=None)]]]
+    """
+    processor_list = defaultdict(list)
     # resolve processor models
     if processors:
         logger.debug(f'Processing parameter "processors"...')
         if TOKENIZE in processors and MWT not in processors:
             add_mwt(processors, resources, lang)
-        for key, value in processors.items():
-            assert(isinstance(key, str) and isinstance(value, str))
+        for key, plist in processors.items():
+            if not isinstance(key, str):
+                raise ValueError("Processor names must be strings")
+            if not isinstance(plist, (tuple, list, str)):
+                raise ValueError("Processor values must be strings")
+            if isinstance(plist, str):
+                plist = [plist]
             if key not in PIPELINE_NAMES:
-                raise UnknownProcessorError(key)
-            # check if keys and values can be found
-            if key in resources[lang] and value in resources[lang][key]:
-                logger.debug(f'Found {key}: {value}.')
-                processor_list[key] = value
-            # allow values to be default in some cases
-            elif key in resources[lang]['default_processors'] and value == 'default':
-                logger.debug(
-                    f'Found {key}: {resources[lang]["default_processors"][key]}.'
-                )
-                processor_list[key] = resources[lang]['default_processors'][key]
-            # allow processors to be set to variants that we didn't implement
-            elif value in PROCESSOR_VARIANTS[key]:
-                logger.debug(
-                    f'Found {key}: {value}. '
-                    f'Using external {value} variant for the {key} processor.'
-                )
-                processor_list[key] = value
-            # allow lemma to be set to "identity"
-            elif key == LEMMA and value == 'identity':
-                logger.debug(
-                    f'Found {key}: {value}. Using identity lemmatizer.'
-                )
-                processor_list[key] = value
-            # not a processor in the officially supported processor list
-            elif key not in resources[lang]:
-                logger.debug(
-                    f'{key}: {value} is not officially supported by Stanza, '
-                    f'loading it anyway.'
-                )
-                processor_list[key] = value
-            # cannot find the package for a processor and warn user
-            else:
-                logger.warning(
-                    f'Can not find {key}: {value} from official model list. '
-                    f'Ignoring it.'
-                )
+                if not allow_pretrain or key not in PRETRAIN_NAMES:
+                    raise UnknownProcessorError(key)
+            for value in plist:
+                # check if keys and values can be found
+                if key in resources[lang] and value in resources[lang][key]:
+                    logger.debug(f'Found {key}: {value}.')
+                    processor_list[key].append(value)
+                # allow values to be default in some cases
+                elif key in resources[lang]['default_processors'] and value == 'default':
+                    logger.debug(
+                        f'Found {key}: {resources[lang]["default_processors"][key]}.'
+                    )
+                    processor_list[key].append(resources[lang]['default_processors'][key])
+                # allow processors to be set to variants that we didn't implement
+                elif value in PROCESSOR_VARIANTS[key]:
+                    logger.debug(
+                        f'Found {key}: {value}. '
+                        f'Using external {value} variant for the {key} processor.'
+                    )
+                    processor_list[key].append(value)
+                # allow lemma to be set to "identity"
+                elif key == LEMMA and value == 'identity':
+                    logger.debug(
+                        f'Found {key}: {value}. Using identity lemmatizer.'
+                    )
+                    processor_list[key].append(value)
+                # not a processor in the officially supported processor list
+                elif key not in resources[lang]:
+                    logger.debug(
+                        f'{key}: {value} is not officially supported by Stanza, '
+                        f'loading it anyway.'
+                    )
+                    processor_list[key].append(value)
+                # cannot find the package for a processor and warn user
+                else:
+                    logger.warning(
+                        f'Can not find {key}: {value} from official model list. '
+                        f'Ignoring it.'
+                    )
     # resolve package
     if package:
         logger.debug(f'Processing parameter "package"...')
@@ -221,7 +255,7 @@ def maintain_processor_list(resources, lang, package, processors):
             for key, value in resources[lang]['default_processors'].items():
                 if key not in processor_list:
                     logger.debug(f'Found {key}: {value}.')
-                    processor_list[key] = value
+                    processor_list[key].append(value)
         else:
             flag = False
             for key in PIPELINE_NAMES:
@@ -230,43 +264,63 @@ def maintain_processor_list(resources, lang, package, processors):
                     flag = True
                     if key not in processor_list:
                         logger.debug(f'Found {key}: {package}.')
-                        processor_list[key] = package
+                        processor_list[key].append(package)
                     else:
                         logger.debug(
                             f'{key}: {package} is overwritten by '
                             f'{key}: {processors[key]}.'
                         )
             if not flag: logger.warning((f'Can not find package: {package}.'))
-    processor_list = [[key, value] for key, value in processor_list.items()]
+    processor_list = [[key, [ModelSpecification(processor=key, package=value, dependencies=None) for value in plist]] for key, plist in processor_list.items()]
     processor_list = sort_processors(processor_list)
     return processor_list
 
 def add_dependencies(resources, lang, processor_list):
+    """
+    Expand the processor_list as given in maintain_processor_list to have the dependencies
+
+    Still a list of model types to ModelSpecifications
+    the dependencies are tuples: name and package
+    for example:
+    [['pos', (ModelSpecification(processor='pos', package='gsd', dependencies=(('pretrain', 'gsd'),)),)],
+     ['depparse', (ModelSpecification(processor='depparse', package='gsd', dependencies=(('pretrain', 'gsd'),)),)]]
+    """
     default_dependencies = resources[lang]['default_dependencies']
     for item in processor_list:
-        processor, package = item
-        dependencies = default_dependencies.get(processor, None)
-        # skip dependency checking for external variants of processors and identity lemmatizer
-        if not any([
-                package in PROCESSOR_VARIANTS[processor],
-                processor == LEMMA and package == 'identity'
-            ]):
-            dependencies = resources[lang].get(processor, {}).get(package, {}) \
-                .get('dependencies', dependencies)
-        if dependencies:
-            dependencies = [[dependency['model'], dependency['package']] \
-                for dependency in dependencies]
-        item.append(dependencies)
+        processor, model_specs = item
+        new_model_specs = []
+        for model_spec in model_specs:
+            dependencies = default_dependencies.get(processor, None)
+            # skip dependency checking for external variants of processors and identity lemmatizer
+            if not any([
+                    model_spec.package in PROCESSOR_VARIANTS[processor],
+                    processor == LEMMA and model_spec.package == 'identity'
+                ]):
+                dependencies = resources[lang].get(processor, {}).get(model_spec.package, {}).get('dependencies', dependencies)
+            if dependencies:
+                dependencies = [(dependency['model'], dependency['package']) for dependency in dependencies]
+                model_spec = model_spec._replace(dependencies=tuple(dependencies))
+            new_model_specs.append(model_spec)
+        item[1] = tuple(new_model_specs)
     return processor_list
 
 def flatten_processor_list(processor_list):
+    """
+    The flattened processor list is just a list of types & packages
+
+    For example:
+      [['pos', 'gsd'], ['depparse', 'gsd'], ['pretrain', 'gsd']]
+    """
     flattened_processor_list = []
     dependencies_list = []
     for item in processor_list:
-        processor, package, dependencies = item
-        flattened_processor_list.append([processor, package])
-        if dependencies:
-            dependencies_list += [tuple(dependency) for dependency in dependencies]
+        processor, model_specs = item
+        for model_spec in model_specs:
+            package = model_spec.package
+            dependencies = model_spec.dependencies
+            flattened_processor_list.append([processor, package])
+            if dependencies:
+                dependencies_list += [tuple(dependency) for dependency in dependencies]
     dependencies_list = [list(item) for item in set(dependencies_list)]
     for processor, package in dependencies_list:
         logger.debug(f'Find dependency {processor}: {package}.')
@@ -317,19 +371,26 @@ def process_pipeline_parameters(lang, model_dir, package, processors):
             f"but got {type(model_dir).__name__} instead."
         )
 
-    if isinstance(package, str):
-        package = package.strip().lower()
-    elif package is not None:
-        raise TypeError(
-            f"The parameter 'package' should be str, "
-            f"but got {type(package).__name__} instead."
-        )
-
-    if isinstance(processors, str):
+    if isinstance(processors, (str, list, tuple)):
         # Special case: processors is str, compatible with older version
+        # also allow for setting alternate packages for these processors
+        # via the package argument
+        if package is None:
+            package = defaultdict(lambda: 'default')
+        elif isinstance(package, str):
+            default = package
+            package = defaultdict(lambda: default)
+        elif isinstance(package, dict):
+            package = defaultdict(lambda: 'default', package)
+        else:
+            raise TypeError(
+                f"The parameter 'package' should be None, str, or dict, "
+                f"but got {type(package).__name__} instead."
+            )
+        if isinstance(processors, str):
+            processors = [x.strip().lower() for x in processors.split(",")]
         processors = {
-            processor.strip().lower(): package \
-                for processor in processors.split(',')
+            processor: package[processor] for processor in processors
         }
         package = None
     elif isinstance(processors, dict):
@@ -343,10 +404,21 @@ def process_pipeline_parameters(lang, model_dir, package, processors):
             f"but got {type(processors).__name__} instead."
         )
 
+    if isinstance(package, str):
+        package = package.strip().lower()
+    elif package is not None:
+        raise TypeError(
+            f"The parameter 'package' should be str, or a dict if 'processors' is a str, "
+            f"but got {type(package).__name__} instead."
+        )
+
     return lang, model_dir, package, processors
 
-def download_resources_json(model_dir, resources_url, resources_branch,
-                            resources_version, proxies=None):
+def download_resources_json(model_dir=DEFAULT_MODEL_DIR,
+                            resources_url=DEFAULT_RESOURCES_URL,
+                            resources_branch=None,
+                            resources_version=DEFAULT_RESOURCES_VERSION,
+                            proxies=None):
     """
     Downloads resources.json to obtain latest packages.
     """
@@ -365,6 +437,18 @@ def download_resources_json(model_dir, resources_url, resources_branch,
     )
 
 
+def load_resources_json(model_dir=DEFAULT_MODEL_DIR):
+    """
+    Unpack the resources json file from the given model_dir
+    """
+    resources_filepath = os.path.join(model_dir, 'resources.json')
+    if not os.path.exists(resources_filepath):
+        raise ResourcesFileNotFoundError(resources_filepath)
+    with open(resources_filepath) as fin:
+        resources = json.load(fin)
+    return resources
+
+
 def list_available_languages(model_dir=DEFAULT_MODEL_DIR,
                              resources_url=DEFAULT_RESOURCES_URL,
                              resources_branch=None,
@@ -373,10 +457,8 @@ def list_available_languages(model_dir=DEFAULT_MODEL_DIR,
     """
     List the non-alias languages in the resources file
     """
-    download_resources_json(model_dir, resources_url, resources_branch,
-                            resources_version, proxies)
-    with open(os.path.join(model_dir, 'resources.json')) as fin:
-        resources = json.load(fin)
+    download_resources_json(model_dir, resources_url, resources_branch, resources_version, proxies)
+    resources = load_resources_json(model_dir)
     # isinstance(str) is because of fields such as "url"
     # 'alias' is because we want to skip German, alias of de, for example
     languages = [lang for lang in resources
@@ -384,6 +466,49 @@ def list_available_languages(model_dir=DEFAULT_MODEL_DIR,
     languages = sorted(languages)
     return languages
 
+def expand_model_url(resources, model_url):
+    """
+    Returns the url in the resources dict if model_url is default, or returns the model_url
+    """
+    return resources['url'] if model_url.lower() == 'default' else model_url
+
+def download_models(download_list,
+                    resources,
+                    lang,
+                    model_dir=DEFAULT_MODEL_DIR,
+                    resources_version=DEFAULT_RESOURCES_VERSION,
+                    model_url=DEFAULT_MODEL_URL,
+                    proxies=None,
+                    log_info=True):
+    lang_name = resources.get(lang, {}).get('lang_name', lang)
+    download_table = make_table(['Processor', 'Package'], download_list)
+    if log_info:
+        log_msg = logger.info
+    else:
+        log_msg = logger.debug
+    log_msg(
+        f'Downloading these customized packages for language: '
+        f'{lang} ({lang_name})...\n{download_table}'
+    )
+
+    url = expand_model_url(resources, model_url)
+
+    # Download packages
+    for key, value in download_list:
+        try:
+            request_file(
+                url.format(resources_version=resources_version, lang=lang, filename=f"{key}/{value}.pt"),
+                os.path.join(model_dir, lang, key, f'{value}.pt'),
+                proxies,
+                md5=resources[lang][key][value]['md5'],
+                log_info=log_info,
+                alternate_md5=resources[lang][key][value].get('alternate_md5', None)
+            )
+        except KeyError as e:
+            raise ValueError(
+                f'Cannot find the following processor and model name combination: '
+                f'{key}, {value}. Please check if you have provided the correct model name.'
+            ) from e
 
 # main download function
 def download(
@@ -406,18 +531,15 @@ def download(
         lang, model_dir, package, processors
     )
 
-    download_resources_json(model_dir, resources_url, resources_branch,
-                            resources_version, proxies)
-    # unpack results
-    with open(os.path.join(model_dir, 'resources.json')) as fin:
-        resources = json.load(fin)
+    download_resources_json(model_dir, resources_url, resources_branch, resources_version, proxies)
+    resources = load_resources_json(model_dir)
     if lang not in resources:
         raise ValueError(f'Unsupported language: {lang}.')
     if 'alias' in resources[lang]:
         logger.info(f'"{lang}" is an alias for "{resources[lang]["alias"]}"')
         lang = resources[lang]['alias']
-    lang_name = resources[lang]['lang_name'] if 'lang_name' in resources[lang] else ''
-    url = resources['url'] if model_url.lower() == 'default' else model_url
+    lang_name = resources.get(lang, {}).get('lang_name', lang)
+    url = expand_model_url(resources, model_url)
 
     # Default: download zipfile and unzip
     if package == 'default' and (processors is None or len(processors) == 0):
@@ -437,29 +559,15 @@ def download(
         unzip(os.path.join(model_dir, lang), 'default.zip')
     # Customize: maintain download list
     else:
-        download_list = maintain_processor_list(
-            resources, lang, package, processors
-        )
+        download_list = maintain_processor_list(resources, lang, package, processors, allow_pretrain=True)
         download_list = add_dependencies(resources, lang, download_list)
         download_list = flatten_processor_list(download_list)
-        download_table = make_table(['Processor', 'Package'], download_list)
-        logger.info(
-            f'Downloading these customized packages for language: '
-            f'{lang} ({lang_name})...\n{download_table}'
-        )
-
-        # Download packages
-        for key, value in download_list:
-            try:
-                request_file(
-                    url.format(resources_version=resources_version, lang=lang, filename=f"{key}/{value}.pt"),
-                    os.path.join(model_dir, lang, key, f'{value}.pt'),
-                    proxies,
-                    md5=resources[lang][key][value]['md5']
-                )
-            except KeyError as e:
-                raise ValueError(
-                    f'Cannot find the following processor and model name combination: '
-                    f'{key}, {value}. Please check if you have provided the correct model name.'
-                ) from e
+        download_models(download_list=download_list,
+                        resources=resources,
+                        lang=lang,
+                        model_dir=model_dir,
+                        resources_version=resources_version,
+                        model_url=model_url,
+                        proxies=proxies,
+                        log_info=True)
     logger.info(f'Finished downloading models and saved to {model_dir}.')

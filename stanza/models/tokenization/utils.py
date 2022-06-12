@@ -8,6 +8,7 @@ import os
 
 import stanza.utils.default_paths as default_paths
 from stanza.models.common.utils import ud_scores, harmonic_mean
+from stanza.models.common.doc import Document
 from stanza.utils.conll import CoNLL
 from stanza.models.common.doc import *
 
@@ -312,22 +313,30 @@ def output_predictions(output_file, trainer, data_generator, vocab, mwt_dict, ma
                 all_preds[p[0]] = pred[j][:len1]
             all_raw[p[0]] = raw[j]
 
+    use_la_ittb_shorthand = trainer.args['shorthand'] == 'la_ittb'
+    oov_count, offset, doc = decode_predictions(vocab, mwt_dict, orig_text, all_raw, all_preds, no_ssplit, skip_newline, use_la_ittb_shorthand)
+
+    if output_file: CoNLL.dict2conll(doc, output_file)
+    return oov_count, offset, all_preds, doc
+
+def decode_predictions(vocab, mwt_dict, orig_text, all_raw, all_preds, no_ssplit, skip_newline, use_la_ittb_shorthand):
+    """
+    Decode the predictions into a document of words
+
+    Once everything is fed through the tokenizer model, it's time to decode the predictions
+    into actual tokens and sentences that the rest of the pipeline uses
+    """
     offset = 0
     oov_count = 0
     doc = []
 
     text = SPACE_RE.sub(' ', orig_text) if orig_text is not None else None
     char_offset = 0
-    use_la_ittb_shorthand = trainer.args['shorthand'] == 'la_ittb'
 
-    UNK_ID = vocab.unit2id('<UNK>')
+    if vocab is not None:
+        UNK_ID = vocab.unit2id('<UNK>')
 
-    # Once everything is fed through the tokenizer model, it's time to decode the predictions
-    # into actual tokens and sentences that the rest of the pipeline uses
-    for j in range(len(paragraphs)):
-        raw = all_raw[j]
-        pred = all_preds[j]
-
+    for raw, pred in zip(all_raw, all_preds):
         current_tok = ''
         current_sent = []
 
@@ -338,12 +347,15 @@ def output_predictions(output_file, trainer, data_generator, vocab, mwt_dict, ma
             if use_la_ittb_shorthand and t in (":", ";"):
                 p = 2
             offset += 1
-            if vocab.unit2id(t) == UNK_ID:
+            if vocab is not None and vocab.unit2id(t) == UNK_ID:
                 oov_count += 1
 
             current_tok += t
             if p >= 1:
-                tok = vocab.normalize_token(current_tok)
+                if vocab is not None:
+                    tok = vocab.normalize_token(current_tok)
+                else:
+                    tok = current_tok
                 assert '\t' not in tok, tok
                 if len(tok) <= 0:
                     current_tok = ''
@@ -358,12 +370,13 @@ def output_predictions(output_file, trainer, data_generator, vocab, mwt_dict, ma
                             match = part_pattern.search(text, char_offset)
                             st0 = match.start(0) - char_offset
                             partlen = match.end(0) - match.start(0)
+                            lstripped = match.group(0).lstrip()
                         else:
                             st0 = text.index(part, char_offset) - char_offset
                             partlen = len(part)
-                        lstripped = part.lstrip()
+                            lstripped = part.lstrip()
                         if st < 0:
-                            st = char_offset + st0 + (len(part) - len(lstripped))
+                            st = char_offset + st0 + (partlen - len(lstripped))
                         char_offset += st0 + partlen
                     position_info = (st, char_offset)
                 else:
@@ -374,12 +387,43 @@ def output_predictions(output_file, trainer, data_generator, vocab, mwt_dict, ma
                     doc.append(process_sentence(current_sent, mwt_dict))
                     current_sent = []
 
-        assert(len(current_tok) == 0)
+        if len(current_tok) > 0:
+            raise ValueError("Finished processing tokens, but there is still text left!")
         if len(current_sent):
             doc.append(process_sentence(current_sent, mwt_dict))
 
-    if output_file: CoNLL.dict2conll(doc, output_file)
-    return oov_count, offset, all_preds, doc
+    return oov_count, offset, doc
+
+def match_tokens_with_text(sentences, orig_text):
+    """
+    Turns pretokenized text and the original text into a Doc object
+
+    sentences: list of list of string
+    orig_text: string, where the text must be exactly the sentences
+      concatenated with 0 or more whitespace characters
+
+    if orig_text deviates in any way, a ValueError will be thrown
+    """
+    text = "".join(["".join(x) for x in sentences])
+    all_raw = list(text)
+    all_preds = [0] * len(all_raw)
+    offset = 0
+    for sentence in sentences:
+        for word in sentence:
+            offset += len(word)
+            all_preds[offset-1] = 1
+        all_preds[offset-1] = 2
+    _, _, doc = decode_predictions(None, None, orig_text, [all_raw], [all_preds], False, False, False)
+    doc = Document(doc, orig_text)
+
+    # check that all the orig_text was used up by the tokens
+    offset = doc.sentences[-1].tokens[-1].end_char
+    remainder = orig_text[offset:].strip()
+    if len(remainder) > 0:
+        raise ValueError("Finished processing tokens, but there is still text left!")
+
+    return doc
+
 
 def eval_model(args, trainer, batches, vocab, mwt_dict):
     oov_count, N, all_preds, doc = output_predictions(args['conll_file'], trainer, batches, vocab, mwt_dict, args['max_seqlen'])

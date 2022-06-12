@@ -35,8 +35,8 @@ class TreeStack(namedtuple('TreeStack', ['value', 'parent', 'length'])):
         return self.parent
 
     def push(self, value):
-        # returns a new StackNode which points to this
-        return TreeStack(value, parent=self, length=self.length+1)
+        # returns a new stack node which points to this
+        return TreeStack(value, self, self.length+1)
 
     def __iter__(self):
         stack = self

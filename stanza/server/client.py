@@ -32,7 +32,8 @@ logger = logging.getLogger('stanza')
 SERVER_PROPS_TMP_FILE_PATTERN = re.compile('corenlp_server-(.*).props')
 
 # Check if str is CoreNLP supported language
-CORENLP_LANGS = ['ar', 'arabic', 'chinese', 'zh', 'english', 'en', 'french', 'fr', 'de', 'german', 'es', 'spanish']
+CORENLP_LANGS = ['ar', 'arabic', 'chinese', 'zh', 'english', 'en', 'french', 'fr', 'de', 'german', 'hu', 'hungarian', 
+                 'it', 'italian', 'es', 'spanish']
 
 # map shorthands to full language names
 LANGUAGE_SHORTHANDS_TO_FULL = {
@@ -41,6 +42,8 @@ LANGUAGE_SHORTHANDS_TO_FULL = {
     "en": "english",
     "fr": "french",
     "de": "german",
+    "hu": "hungarian",
+    "it": "italian",
     "es": "spanish"
 }
 
@@ -234,9 +237,10 @@ def resolve_classpath(classpath=None):
     elif classpath is None:
         classpath = os.getenv("CORENLP_HOME", os.path.join(str(Path.home()), 'stanza_corenlp'))
 
-        assert os.path.exists(classpath), \
-            "Please install CoreNLP by running `stanza.install_corenlp()`. If you have installed it, please define " \
-            "$CORENLP_HOME to be location of your CoreNLP distribution or pass in a classpath parameter."
+        if not os.path.exists(classpath):
+            raise FileNotFoundError("Please install CoreNLP by running `stanza.install_corenlp()`. If you have installed it, please define "
+                                    "$CORENLP_HOME to be location of your CoreNLP distribution or pass in a classpath parameter.  "
+                                    "$CORENLP_HOME={}".format(os.getenv("CORENLP_HOME")))
         classpath = os.path.join(classpath, "*")
     return classpath
 
@@ -256,6 +260,7 @@ class CoreNLPClient(RobustService):
                  timeout=DEFAULT_TIMEOUT,
                  threads=DEFAULT_THREADS,
                  annotators=None,
+                 pretokenized=False,
                  output_format=None,
                  properties=None,
                  stdout=None,
@@ -279,6 +284,7 @@ class CoreNLPClient(RobustService):
         # set up client defaults
         self.properties = properties
         self.annotators = annotators
+        self.pretokenized = pretokenized
         self.output_format = output_format
         self._setup_client_defaults()
         # start the server
@@ -309,6 +315,10 @@ class CoreNLPClient(RobustService):
             # set up server defaults
             if self.server_props_path is not None:
                 start_cmd += f" -serverProperties {self.server_props_path}"
+
+            # possibly set pretokenized
+            if self.pretokenized:
+                start_cmd += f" -preTokenized"
 
             # set annotators for server default
             if self.annotators is not None:
@@ -565,6 +575,14 @@ class CoreNLPClient(RobustService):
         return matches
 
     def tregex(self, text, pattern, filter=False, annotators=None, properties=None):
+        # parse is not included by default in some of the pipelines,
+        # so we may need to manually override the annotators
+        # to include parse in order for tregex to do anything
+        if annotators is None and self.annotators is not None:
+            if "parse" not in self.annotators:
+                annotators = self.annotators + ",parse"
+        else:
+            annotators = "tokenize,ssplit,pos,parse"
         return self.__regex('/tregex', text, pattern, filter, annotators, properties)
 
     def __regex(self, path, text, pattern, filter, annotators=None, properties=None):
@@ -615,6 +633,8 @@ class CoreNLPClient(RobustService):
                 timeout=(self.timeout*2)/1000,
             )
             r.raise_for_status()
+            if r.encoding is None:
+                r.encoding = "utf-8"
             return json.loads(r.text)
         except requests.HTTPError as e:
             if r.text.startswith("Timeout"):

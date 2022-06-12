@@ -7,6 +7,8 @@ Please keep synced with
 These language codes mirror UD language codes when possible
 """
 
+import re
+
 lcode2lang = {
     "af": "Afrikaans",
     "akk": "Akkadian",
@@ -81,6 +83,7 @@ lcode2lang = {
     "gun": "Mbya_Guarani",
     "mdf": "Moksha",
     "myu": "Munduruku",
+    "my": "Myanmar",
     "pcm": "Naija",
     "nyq": "Nayini",
     "sme": "North_Sami",
@@ -153,10 +156,14 @@ treebank_special_cases = {
     "UD_Norwegian-NynorskLIA": "nn_nynorsklia",
 }
 
+SHORTNAME_RE = re.compile("[a-z-]+_[a-z0-9]+")
+
 def treebank_to_short_name(treebank):
     """ Convert treebank name to short code. """
     if treebank in treebank_special_cases:
         return treebank_special_cases.get(treebank)
+    if SHORTNAME_RE.match(treebank):
+        short_name = treebank
 
     if treebank.startswith('UD_'):
         treebank = treebank[3:]
@@ -176,6 +183,8 @@ def treebank_to_short_name(treebank):
         lcode = langlower2lcode[lang]
     elif lang in lcode2lang:
         lcode = lang
+    elif lang.lower() in lcode2lang:
+        lcode = lang.lower()
     else:
         raise ValueError("Unable to find language code for %s" % lang)
 

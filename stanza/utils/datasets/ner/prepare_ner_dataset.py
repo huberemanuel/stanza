@@ -13,10 +13,9 @@ Also, Finnish Turku dataset, available here:
   - prepare_ner_dataset.py fi_turku
 
 FBK in Italy produced an Italian dataset.
-  The processing here is for a combined .tsv file they sent us.
-  - prepare_ner_dataset.py it_fbk
-
-FBK in Italy produced an Italian dataset.
+  - KIND: an Italian Multi-Domain Dataset for Named Entity Recognition
+    Paccosi T. and Palmero Aprosio A.
+    LREC 2022
   The processing here is for a combined .tsv file they sent us.
   - prepare_ner_dataset.py it_fbk
 
@@ -97,11 +96,94 @@ NCHLT produced NER datasets for many African languages.
   - Xitsonga:   https://repo.sadilar.org/handle/20.500.12185/362
   Agree to the license, download the zip, and unzip it in
   $NERBASE/NCHLT
+
+UCSY built a Myanmar dataset.  They have not made it publicly
+  available, but they did make it available to Stanford for research
+  purposes.  Contact Chris Manning or John Bauer for the data files if
+  you are Stanford affiliated.
+  - https://arxiv.org/abs/1903.04739
+  - Syllable-based Neural Named Entity Recognition for Myanmar Language
+    by Hsu Myat Mo and Khin Mar Soe
+
+Hanieh Poostchi et al produced a Persian NER dataset:
+  - git@github.com:HaniehP/PersianNER.git
+  - https://github.com/HaniehP/PersianNER
+  - Hanieh Poostchi, Ehsan Zare Borzeshi, Mohammad Abdous, and Massimo Piccardi,
+    "PersoNER: Persian Named-Entity Recognition"
+  - Hanieh Poostchi, Ehsan Zare Borzeshi, and Massimo Piccardi,
+    "BiLSTM-CRF for Persian Named-Entity Recognition; ArmanPersoNERCorpus: the First Entity-Annotated Persian Dataset"
+  - Conveniently, this dataset is already in BIO format.  It does not have a dev split, though.
+    git clone the above repo, unzip ArmanPersoNERCorpus.zip, and this script will split the
+    first train fold into a dev section.
+
+SUC3 is a Swedish NER dataset provided by Språkbanken
+  - https://spraakbanken.gu.se/en/resources/suc3
+  - The splitting tool is generously provided by
+    Emil Stenstrom
+    https://github.com/EmilStenstrom/suc_to_iob
+  - Download the .bz2 file at this URL and put it in $NERBASE/sv_suc3shuffle
+    It is not necessary to unzip it.
+  - Gustafson-Capková, Sophia and Britt Hartmann, 2006, 
+    Manual of the Stockholm Umeå Corpus version 2.0.
+    Stockholm University.
+  - Östling, Robert, 2013, Stagger 
+    an Open-Source Part of Speech Tagger for Swedish
+    Northern European Journal of Language Technology 3: 1–18
+    DOI 10.3384/nejlt.2000-1533.1331
+  - The shuffled dataset can be converted with dataset code
+    prepare_ner_dataset.py sv_suc3shuffle
+  - If you fill out the license form and get the official data,
+    you can get the official splits by putting the provided zip file
+    in $NERBASE/sv_suc3licensed.  Again, not necessary to unzip it
+    prepare_ner_dataset.py sv_suc3licensed
+
+DDT is a reformulation of the Danish Dependency Treebank as an NER dataset
+  - https://danlp-alexandra.readthedocs.io/en/latest/docs/datasets.html#dane
+  - direct download link as of late 2021: https://danlp.alexandra.dk/304bd159d5de/datasets/ddt.zip
+  - https://aclanthology.org/2020.lrec-1.565.pdf
+    DaNE: A Named Entity Resource for Danish
+    Rasmus Hvingelby, Amalie Brogaard Pauli, Maria Barrett,
+    Christina Rosted, Lasse Malm Lidegaard, Anders Søgaard
+  - place ddt.zip in $NERBASE/da_ddt/ddt.zip
+    prepare_ner_dataset.py da_ddt
+
+NorNE is the Norwegian Dependency Treebank with NER labels
+  - LREC 2020
+    NorNE: Annotating Named Entities for Norwegian
+    Fredrik Jørgensen, Tobias Aasmoe, Anne-Stine Ruud Husevåg,
+    Lilja Øvrelid, and Erik Velldal
+  - both Bokmål and Nynorsk
+  - This dataset is in a git repo:
+    https://github.com/ltgoslo/norne
+    Clone it into $NERBASE
+    git clone git@github.com:ltgoslo/norne.git
+    prepare_ner_dataset.py nb_norne
+    prepare_ner_dataset.py nn_norne
+
+starlang is a set of constituency trees for Turkish
+  The words in this dataset (usually) have NER labels as well
+
+  A dataset in three parts from the Starlang group in Turkey:
+  Neslihan Kara, Büşra Marşan, et al
+    Creating A Syntactically Felicitous Constituency Treebank For Turkish
+    https://ieeexplore.ieee.org/document/9259873
+  git clone the following three repos
+    https://github.com/olcaytaner/TurkishAnnotatedTreeBank-15
+    https://github.com/olcaytaner/TurkishAnnotatedTreeBank2-15
+    https://github.com/olcaytaner/TurkishAnnotatedTreeBank2-20
+  Put them in
+    $CONSTITUENCY_HOME/turkish    (yes, the constituency home)
+  prepare_ner_dataset.py tr_starlang
+
+en_sample is the toy dataset included with stanza-train
+  https://github.com/stanfordnlp/stanza-train
+  this is not meant for any kind of actual NER use
 """
 
 import glob
 import os
 import random
+import shutil
 import sys
 import tempfile
 
@@ -110,15 +192,25 @@ import stanza.utils.default_paths as default_paths
 
 from stanza.utils.datasets.ner.preprocess_wikiner import preprocess_wikiner
 from stanza.utils.datasets.ner.split_wikiner import split_wikiner
+import stanza.utils.datasets.ner.conll_to_iob as conll_to_iob
 import stanza.utils.datasets.ner.convert_bsf_to_beios as convert_bsf_to_beios
 import stanza.utils.datasets.ner.convert_bsnlp as convert_bsnlp
 import stanza.utils.datasets.ner.convert_fire_2013 as convert_fire_2013
 import stanza.utils.datasets.ner.convert_ijc as convert_ijc
+import stanza.utils.datasets.ner.convert_my_ucsy as convert_my_ucsy
 import stanza.utils.datasets.ner.convert_rgai as convert_rgai
 import stanza.utils.datasets.ner.convert_nytk as convert_nytk
+import stanza.utils.datasets.ner.convert_starlang_ner as convert_starlang_ner
 import stanza.utils.datasets.ner.prepare_ner_file as prepare_ner_file
+import stanza.utils.datasets.ner.suc_to_iob as suc_to_iob
+import stanza.utils.datasets.ner.suc_conll_to_iob as suc_conll_to_iob
 
 SHARDS = ('train', 'dev', 'test')
+
+class UnknownDatasetError(ValueError):
+    def __init__(self, dataset, text):
+        super().__init__(text)
+        self.dataset = dataset
 
 def convert_bio_to_json(base_input_path, base_output_path, short_name, suffix="bio"):
     """
@@ -131,10 +223,25 @@ def convert_bio_to_json(base_input_path, base_output_path, short_name, suffix="b
     for shard in SHARDS:
         input_filename = os.path.join(base_input_path, '%s.%s.%s' % (short_name, shard, suffix))
         if not os.path.exists(input_filename):
-            raise FileNotFoundError('Cannot find %s component of %s in %s' % (shard, short_name, input_filename))
+            alt_filename = os.path.join(base_input_path, '%s.%s' % (shard, suffix))
+            if os.path.exists(alt_filename):
+                input_filename = alt_filename
+            else:
+                raise FileNotFoundError('Cannot find %s component of %s in %s' % (shard, short_name, input_filename))
         output_filename = os.path.join(base_output_path, '%s.%s.json' % (short_name, shard))
         print("Converting %s to %s" % (input_filename, output_filename))
         prepare_ner_file.process_dataset(input_filename, output_filename)
+
+def write_dataset(datasets, output_dir, short_name, suffix="bio"):
+    for shard, dataset in zip(SHARDS, datasets):
+        output_filename = os.path.join(output_dir, "%s.%s.%s" % (short_name, shard, suffix))
+        with open(output_filename, "w", encoding="utf-8") as fout:
+            for sentence in dataset:
+                for word in sentence:
+                    fout.write("%s\t%s\n" % word)
+                fout.write("\n")
+
+    convert_bio_to_json(output_dir, output_dir, short_name, suffix)
 
 def process_turku(paths):
     short_name = 'fi_turku'
@@ -215,7 +322,7 @@ def process_fire_2013(paths, dataset):
     langcode, _ = short_name.split("_")
     short_name = "%s_fire2013" % langcode
     if not langcode in ("hi", "en", "ta", "bn", "mal"):
-        raise ValueError("Language %s not one of the FIRE 2013 languages")
+        raise UnkonwnDatasetError(dataset, "Language %s not one of the FIRE 2013 languages" % langcode)
     language = lcode2lang[langcode].lower()
     
     # for example, FIRE2013/hindi_train
@@ -245,21 +352,14 @@ def process_wikiner(paths, dataset):
     elif len(input_files) > 1:
         raise FileNotFoundError("Found too many raw wikiner files in %s: %s" % (raw_input_path, ", ".join(input_files)))
 
-    csv_file = os.path.join(raw_input_path, "csv_" + short_name)
+    csv_file = os.path.join(base_output_path, short_name + "_csv")
     print("Converting raw input %s to space separated file in %s" % (input_files[0], csv_file))
     preprocess_wikiner(input_files[0], csv_file)
 
     # this should create train.bio, dev.bio, and test.bio
-    print("Splitting %s to %s" % (csv_file, base_input_path))
-    split_wikiner(base_input_path, csv_file)
-
-    for shard in SHARDS:
-        input_filename = os.path.join(base_input_path, '%s.bio' % shard)
-        if not os.path.exists(input_filename):
-            raise FileNotFoundError('Cannot find %s component of %s in %s' % (shard, short_name, input_filename))
-        output_filename = os.path.join(base_output_path, '%s.%s.json' % (short_name, shard))
-        print("Converting %s to %s" % (input_filename, output_filename))
-        prepare_ner_file.process_dataset(input_filename, output_filename)
+    print("Splitting %s to %s" % (csv_file, base_output_path))
+    split_wikiner(base_output_path, csv_file, prefix=short_name)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
 
 def get_rgai_input_path(paths):
     return os.path.join(paths["NERBASE"], "hu_rgai")
@@ -278,7 +378,7 @@ def process_rgai(paths, short_name):
         use_business = False
         use_criminal = True
     else:
-        raise ValueError("Unknown subset of hu_rgai data: %s" % short_name)
+        raise UnknownDatasetError(short_name, "Unknown subset of hu_rgai data: %s" % short_name)
 
     convert_rgai.convert_rgai(base_input_path, base_output_path, short_name, use_business, use_criminal)
     convert_bio_to_json(base_output_path, base_output_path, short_name)
@@ -357,7 +457,7 @@ def process_bsnlp(paths, short_name):
     convert_bsnlp.convert_bsnlp(language, base_test_path, output_test_filename)
     convert_bsnlp.convert_bsnlp(language, base_train_path, output_train_filename, output_dev_filename)
 
-    for shard, csv_file in zip(('train', 'dev', 'test'), (output_train_filename, output_dev_filename, output_test_filename)):
+    for shard, csv_file in zip(SHARDS, (output_train_filename, output_dev_filename, output_test_filename)):
         output_filename = os.path.join(base_output_path, '%s.%s.json' % (short_name, shard))
         prepare_ner_file.process_dataset(csv_file, output_filename)
 
@@ -379,7 +479,7 @@ NCHLT_LANGUAGE_MAP = {
 def process_nchlt(paths, short_name):
     language = short_name.split("_")[0]
     if not language in NCHLT_LANGUAGE_MAP:
-        raise ValueError("Language %s not part of NCHLT" % language)
+        raise UnknownDatasetError(short_name, "Language %s not part of NCHLT" % language)
     short_name = "%s_nchlt" % language
 
     base_input_path = os.path.join(paths["NERBASE"], "NCHLT", NCHLT_LANGUAGE_MAP[language], "*Full.txt")
@@ -394,6 +494,151 @@ def process_nchlt(paths, short_name):
     split_wikiner(base_output_path, input_files[0], prefix=short_name, remap={"OUT": "O"})
     convert_bio_to_json(base_output_path, base_output_path, short_name)
 
+def process_my_ucsy(paths):
+    language = "my"
+    short_name = "my_ucsy"
+
+    base_input_path = os.path.join(paths["NERBASE"], short_name)
+    base_output_path = paths["NER_DATA_DIR"]
+    convert_my_ucsy.convert_my_ucsy(base_input_path, base_output_path)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
+
+def process_fa_arman(paths, short_name):
+    """
+    Converts fa_arman dataset
+
+    The conversion is quite simple, actually.
+    Just need to split the train file and then convert bio -> json
+    """
+    assert short_name == "fa_arman"
+    language = "fa"
+    base_input_path = os.path.join(paths["NERBASE"], "PersianNER")
+    train_input_file = os.path.join(base_input_path, "train_fold1.txt")
+    test_input_file = os.path.join(base_input_path, "test_fold1.txt")
+    if not os.path.exists(train_input_file) or not os.path.exists(test_input_file):
+        full_corpus_file = os.path.join(base_input_path, "ArmanPersoNERCorpus.zip")
+        if os.path.exists(full_corpus_file):
+            raise FileNotFoundError("Please unzip the file {}".format(full_corpus_file))
+        raise FileNotFoundError("Cannot find the arman corpus in the expected directory: {}".format(base_input_path))
+
+    base_output_path = paths["NER_DATA_DIR"]
+    test_output_file = os.path.join(base_output_path, "%s.test.bio" % short_name)
+
+    split_wikiner(base_output_path, train_input_file, prefix=short_name, train_fraction=0.8, test_section=False)
+    shutil.copy2(test_input_file, test_output_file)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
+
+def process_sv_suc3licensed(paths, short_name):
+    """
+    The .zip provided for SUC3 includes train/dev/test splits already
+
+    This extracts those splits without needing to unzip the original file
+    """
+    assert short_name == "sv_suc3licensed"
+    language = "sv"
+    train_input_file = os.path.join(paths["NERBASE"], short_name, "SUC3.0.zip")
+    if not os.path.exists(train_input_file):
+        raise FileNotFoundError("Cannot find the officially licensed SUC3 dataset in %s" % train_input_file)
+
+    base_output_path = paths["NER_DATA_DIR"]
+    suc_conll_to_iob.process_suc3(train_input_file, short_name, base_output_path)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
+
+def process_sv_suc3shuffle(paths, short_name):
+    """
+    Uses an externally provided script to read the SUC3 XML file, then splits it
+    """
+    assert short_name == "sv_suc3shuffle"
+    language = "sv"
+    train_input_file = os.path.join(paths["NERBASE"], short_name, "suc3.xml.bz2")
+    if not os.path.exists(train_input_file):
+        train_input_file = train_input_file[:-4]
+    if not os.path.exists(train_input_file):
+        raise FileNotFoundError("Unable to find the SUC3 dataset in {}.bz2".format(train_input_file))
+
+    base_output_path = paths["NER_DATA_DIR"]
+    train_output_file = os.path.join(base_output_path, "sv_suc3shuffle.bio")
+    suc_to_iob.main([train_input_file, train_output_file])
+    split_wikiner(base_output_path, train_output_file, prefix=short_name)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)    
+    
+def process_da_ddt(paths, short_name):
+    """
+    Processes Danish DDT dataset
+
+    This dataset is in a conll file with the "name" attribute in the
+    misc column for the NER tag.  This function uses a script to
+    convert such CoNLL files to .bio
+    """
+    assert short_name == "da_ddt"
+    language = "da"
+    IN_FILES = ("ddt.train.conllu", "ddt.dev.conllu", "ddt.test.conllu")
+
+    base_output_path = paths["NER_DATA_DIR"]
+    OUT_FILES = [os.path.join(base_output_path, "%s.%s.bio" % (short_name, shard)) for shard in SHARDS]
+
+    zip_file = os.path.join(paths["NERBASE"], "da_ddt", "ddt.zip")
+    if os.path.exists(zip_file):
+        for in_filename, out_filename, shard in zip(IN_FILES, OUT_FILES, SHARDS):
+            conll_to_iob.process_conll(in_filename, out_filename, zip_file)
+    else:
+        for in_filename, out_filename, shard in zip(IN_FILES, OUT_FILES, SHARDS):
+            in_filename = os.path.join(paths["NERBASE"], "da_ddt", in_filename)
+            if not os.path.exists(in_filename):
+                raise FileNotFoundError("Could not find zip in expected location %s and could not file %s file in %s" % (zip_file, shard, in_filename))
+
+            conll_to_iob.process_conll(in_filename, out_filename)
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
+
+
+def process_norne(paths, short_name):
+    """
+    Processes Norwegian NorNE
+
+    Can handle either Bokmål or Nynorsk
+
+    Converts GPE_LOC and GPE_ORG to GPE
+    """
+    language, name = short_name.split("_", 1)
+    assert language in ('nb', 'nn')
+    assert name == 'norne'
+
+    if language == 'nb':
+        IN_FILES = ("nob/no_bokmaal-ud-train.conllu", "nob/no_bokmaal-ud-dev.conllu", "nob/no_bokmaal-ud-test.conllu")
+    else:
+        IN_FILES = ("nno/no_nynorsk-ud-train.conllu", "nno/no_nynorsk-ud-dev.conllu", "nno/no_nynorsk-ud-test.conllu")
+
+    base_output_path = paths["NER_DATA_DIR"]
+    OUT_FILES = [os.path.join(base_output_path, "%s.%s.bio" % (short_name, shard)) for shard in SHARDS]
+
+    CONVERSION = { "GPE_LOC": "GPE", "GPE_ORG": "GPE" }
+
+    for in_filename, out_filename, shard in zip(IN_FILES, OUT_FILES, SHARDS):
+        in_filename = os.path.join(paths["NERBASE"], "norne", "ud", in_filename)
+        if not os.path.exists(in_filename):
+            raise FileNotFoundError("Could not find %s file in %s" % (shard, in_filename))
+
+        conll_to_iob.process_conll(in_filename, out_filename, conversion=CONVERSION)
+
+    convert_bio_to_json(base_output_path, base_output_path, short_name)
+
+def process_starlang(paths, short_name):
+    """
+    Process a Turkish dataset from Starlang
+    """
+    assert short_name == 'tr_starlang'
+
+    PIECES = ["TurkishAnnotatedTreeBank-15",
+              "TurkishAnnotatedTreeBank2-15",
+              "TurkishAnnotatedTreeBank2-20"]
+
+    chunk_paths = [os.path.join(paths["CONSTITUENCY_BASE"], "turkish", piece) for piece in PIECES]
+    datasets = convert_starlang_ner.read_starlang(chunk_paths)
+
+    write_dataset(datasets, paths["NER_DATA_DIR"], short_name)
+
+def process_toy_dataset(paths, short_name):
+    convert_bio_to_json(os.path.join(paths["NERBASE"], "English-SAMPLE"), paths["NER_DATA_DIR"], short_name)
 
 def main(dataset_name):
     paths = default_paths.get_default_paths()
@@ -420,10 +665,26 @@ def main(dataset_name):
         process_hu_combined(paths)
     elif dataset_name.endswith("_bsnlp19"):
         process_bsnlp(paths, dataset_name)
+    elif dataset_name == 'my_ucsy':
+        process_my_ucsy(paths)
     elif dataset_name.endswith("_nchlt"):
         process_nchlt(paths, dataset_name)
+    elif dataset_name == "fa_arman":
+        process_fa_arman(paths, dataset_name)
+    elif dataset_name == "sv_suc3licensed":
+        process_sv_suc3licensed(paths, dataset_name)
+    elif dataset_name == "sv_suc3shuffle":
+        process_sv_suc3shuffle(paths, dataset_name)
+    elif dataset_name == "da_ddt":
+        process_da_ddt(paths, dataset_name)
+    elif dataset_name in ("nb_norne", "nn_norne"):
+        process_norne(paths, dataset_name)
+    elif dataset_name == 'tr_starlang':
+        process_starlang(paths, dataset_name)
+    elif dataset_name == 'en_sample':
+        process_toy_dataset(paths, dataset_name)
     else:
-        raise ValueError(f"dataset {dataset_name} currently not handled")
+        raise UnknownDatasetError(dataset_name, f"dataset {dataset_name} currently not handled by prepare_ner_dataset")
 
 if __name__ == '__main__':
     main(sys.argv[1])

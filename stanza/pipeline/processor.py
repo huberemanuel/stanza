@@ -146,7 +146,7 @@ class ProcessorVariant(ABC):
         return [self.process(doc) for doc in docs]
 
 class UDProcessor(Processor):
-    """ Base class for the neural UD Processors (tokenize,mwt,pos,lemma,depparse,sentiment) """
+    """ Base class for the neural UD Processors (tokenize,mwt,pos,lemma,depparse,sentiment,constituency) """
 
     def __init__(self, config, pipeline, use_gpu):
         super().__init__(config, pipeline, use_gpu)
@@ -156,13 +156,13 @@ class UDProcessor(Processor):
         self._trainer = None
         self._vocab = None
         if not hasattr(self, '_variant'):
-            self._set_up_model(config, use_gpu)
+            self._set_up_model(config, pipeline, use_gpu)
 
         # build the final config for the processor
         self._set_up_final_config(config)
 
     @abstractmethod
-    def _set_up_model(self, config, gpu):
+    def _set_up_model(self, config, pipeline, gpu):
         pass
 
     def _set_up_final_config(self, config):

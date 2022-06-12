@@ -2,6 +2,7 @@
 Pipeline that runs tokenize,mwt,pos,lemma,depparse
 """
 
+from enum import Enum
 import io
 import itertools
 import sys
@@ -13,8 +14,9 @@ import os
 from distutils.util import strtobool
 from stanza.pipeline._constants import *
 from stanza.models.common.doc import Document
+from stanza.models.common.foundation_cache import FoundationCache
 from stanza.pipeline.processor import Processor, ProcessorRequirementsException
-from stanza.pipeline.registry import NAME_TO_PROCESSOR_CLASS, PIPELINE_NAMES
+from stanza.pipeline.registry import NAME_TO_PROCESSOR_CLASS, PIPELINE_NAMES, PROCESSOR_VARIANTS
 from stanza.pipeline.langid_processor import LangIDProcessor
 from stanza.pipeline.tokenize_processor import TokenizeProcessor
 from stanza.pipeline.mwt_processor import MWTProcessor
@@ -24,16 +26,22 @@ from stanza.pipeline.depparse_processor import DepparseProcessor
 from stanza.pipeline.sentiment_processor import SentimentProcessor
 from stanza.pipeline.constituency_processor import ConstituencyProcessor
 from stanza.pipeline.ner_processor import NERProcessor
-from stanza.resources.common import DEFAULT_MODEL_DIR, \
-    maintain_processor_list, add_dependencies, add_mwt, build_default_config, set_logging_level, process_pipeline_parameters, sort_processors
+from stanza.resources.common import DEFAULT_MODEL_DIR, DEFAULT_RESOURCES_URL, DEFAULT_RESOURCES_VERSION, ModelSpecification, add_dependencies, add_mwt, download_models, download_resources_json, flatten_processor_list, load_resources_json, maintain_processor_list, process_pipeline_parameters, set_logging_level, sort_processors
 from stanza.utils.helper_func import make_table
 
 logger = logging.getLogger('stanza')
 
-class ResourcesFileNotFoundError(FileNotFoundError):
-    def __init__(self, resources_filepath):
-        super().__init__(f"Resources file not found at: {resources_filepath}  Try to download the model again.")
-        self.resources_filepath = resources_filepath
+class DownloadMethod(Enum):
+    """
+    Determines a couple options on how to download resources for the pipeline.
+
+    NONE will not download anything, probably resulting in failure if the resources aren't already in place.
+    REUSE_RESOURCES will reuse the existing resources.json and models, but will download any missing models.
+    DOWNLOAD_RESOURCES will download a new resources.json and will overwrite any out of date models.
+    """
+    NONE = 1
+    REUSE_RESOURCES = 2
+    DOWNLOAD_RESOURCES = 3
 
 class LanguageNotDownloadedError(FileNotFoundError):
     def __init__(self, lang, lang_dir, model_path):
@@ -47,6 +55,10 @@ class UnsupportedProcessorError(FileNotFoundError):
         super().__init__(f'Processor {processor} is not known for language {lang}.  If you have created your own model, please specify the {processor}_model_path parameter when creating the pipeline.')
         self.processor = processor
         self.lang = lang
+
+class IllegalPackageError(ValueError):
+    def __init__(self, msg):
+        super().__init__(msg)
 
 class PipelineRequirementsException(Exception):
     """
@@ -70,26 +82,121 @@ class PipelineRequirementsException(Exception):
     def __str__(self):
         return self.message
 
+def build_default_config_option(model_specs):
+    """
+    Build a config option for a couple situations: lemma=identity, processor is a variant
+
+    Returns the option name and value
+
+    Refactored from build_default_config so that we can reuse it when
+    downloading all models
+    """
+    # handle case when processor variants are used
+    if any(model_spec.package in PROCESSOR_VARIANTS[model_spec.processor] for model_spec in model_specs):
+        if len(model_specs) > 1:
+            raise IllegalPackageError("Variant processor selected for {}, but multiple packages requested".format(model_spec.processor))
+        return f"{model_specs[0].processor}_with_{model_specs[0].package}", True
+    # handle case when identity is specified as lemmatizer
+    elif any(model_spec.processor == LEMMA and model_spec.package == 'identity' for model_spec in model_specs):
+        if len(model_specs) > 1:
+            raise IllegalPackageError("Identity processor selected for lemma, but multiple packages requested")
+        return f"{LEMMA}_use_identity", True
+    return None
+
+def filter_variants(model_specs):
+    return [(key, value) for (key, value) in model_specs if build_default_config_option(value) is None]
+
+# given a language and models path, build a default configuration
+def build_default_config(resources, lang, model_dir, load_list):
+    default_config = {}
+    for processor, model_specs in load_list:
+        option = build_default_config_option(model_specs)
+        if option is not None:
+            # if an option is set for the model_specs, keep that option and ignore
+            # the rest of the model spec
+            default_config[option[0]] = option[1]
+            continue
+
+        model_paths = [os.path.join(model_dir, lang, processor, model_spec.package + '.pt') for model_spec in model_specs]
+        dependencies = [model_spec.dependencies for model_spec in model_specs]
+
+        # Special case for NER: load multiple models at once
+        # The pattern will be:
+        #   a list of ner_model_path
+        #   a list of ner_dependencies
+        #     where each item in ner_dependencies is a map
+        #     the map may contain forward_charlm_path, backward_charlm_path, or any other deps
+        # The user will be able to override the defaults using a semicolon separated string
+        # TODO: at least use the same config pattern for all other models
+        if processor == NER:
+            default_config[f"{processor}_model_path"] = model_paths
+            dependency_paths = []
+            for dependency_block in dependencies:
+                if not dependency_block:
+                    dependency_paths.append({})
+                    continue
+                dependency_paths.append({})
+                for dependency in dependency_block:
+                    dep_processor, dep_model = dependency
+                    dependency_paths[-1][f"{dep_processor}_path"] = os.path.join(model_dir, lang, dep_processor, dep_model + '.pt')
+            default_config[f"{processor}_dependencies"] = dependency_paths
+            continue
+
+        if len(model_specs) > 1:
+            raise IllegalPackageError("Specified multiple packages for {}, which currently only handles one package".format(processor))
+
+        default_config[f"{processor}_model_path"] = model_paths[0]
+        if not dependencies[0]: continue
+        for dependency in dependencies[0]:
+            dep_processor, dep_model = dependency
+            default_config[f"{processor}_{dep_processor}_path"] = os.path.join(
+                model_dir, lang, dep_processor, dep_model + '.pt'
+            )
+
+    return default_config
 
 class Pipeline:
 
-    def __init__(self, lang='en', dir=DEFAULT_MODEL_DIR, package='default', processors={}, logging_level=None, verbose=None, use_gpu=True, model_dir=None, **kwargs):
+    def __init__(self,
+                 lang='en',
+                 dir=DEFAULT_MODEL_DIR,
+                 package='default',
+                 processors={},
+                 logging_level=None,
+                 verbose=None,
+                 use_gpu=True,
+                 model_dir=None,
+                 download_method=DownloadMethod.DOWNLOAD_RESOURCES,
+                 resources_url=DEFAULT_RESOURCES_URL,
+                 resources_branch=None,
+                 resources_version=DEFAULT_RESOURCES_VERSION,
+                 proxies=None,
+                 **kwargs):
         self.lang, self.dir, self.kwargs = lang, dir, kwargs
         if model_dir is not None and dir == DEFAULT_MODEL_DIR:
             self.dir = model_dir
 
         # set global logging level
         set_logging_level(logging_level, verbose)
+
+        # processors can use this to save on the effort of loading
+        # large sub-models, such as pretrained embeddings, bert, etc
+        self.foundation_cache = FoundationCache()
+
+        if (download_method is DownloadMethod.DOWNLOAD_RESOURCES or
+            (download_method is DownloadMethod.REUSE_RESOURCES and not os.path.exists(os.path.join(self.dir, "resources.json")))):
+            download_resources_json(self.dir,
+                                    resources_url=resources_url,
+                                    resources_branch=resources_branch,
+                                    resources_version=resources_version,
+                                    proxies=proxies)
+
         # process different pipeline parameters
         lang, self.dir, package, processors = process_pipeline_parameters(lang, self.dir, package, processors)
 
         # Load resources.json to obtain latest packages.
         logger.debug('Loading resource file...')
-        resources_filepath = os.path.join(self.dir, 'resources.json')
-        if not os.path.exists(resources_filepath):
-            raise ResourcesFileNotFoundError(resources_filepath)
-        with open(resources_filepath) as infile:
-            resources = json.load(infile)
+        resources = load_resources_json(self.dir)
         if lang in resources:
             if 'alias' in resources[lang]:
                 logger.info(f'"{lang}" is an alias for "{resources[lang]["alias"]}"')
@@ -105,10 +212,25 @@ class Pipeline:
             add_mwt(processors, resources, lang)
         self.load_list = maintain_processor_list(resources, lang, package, processors) if lang in resources else []
         self.load_list = add_dependencies(resources, lang, self.load_list) if lang in resources else []
+        if download_method is not None and download_method is not DownloadMethod.NONE:
+            # skip processors which aren't downloaded from our collection
+            download_list = [x for x in self.load_list if x[0] in resources.get(lang, {})]
+            # skip variants
+            download_list = filter_variants(download_list)
+            # gather up the model list...
+            download_list = flatten_processor_list(download_list)
+            # download_models will skip models we already have
+            download_models(download_list,
+                            resources=resources,
+                            lang=lang,
+                            model_dir=self.dir,
+                            resources_version=resources_version,
+                            proxies=proxies,
+                            log_info=False)
         self.load_list = self.update_kwargs(kwargs, self.load_list)
         if len(self.load_list) == 0:
             raise ValueError('No processors to load for language {}.  Please check if your language or package is correctly set.'.format(lang))
-        load_table = make_table(['Processor', 'Package'], [row[:2] for row in self.load_list])
+        load_table = make_table(['Processor', 'Package'], [(row[0], ";".join(model_spec.package for model_spec in row[1])) for row in self.load_list])
         logger.info(f'Loading these models for language: {lang} ({lang_name}):\n{load_table}')
 
         self.config = build_default_config(resources, lang, self.dir, self.load_list)
@@ -125,7 +247,7 @@ class Pipeline:
         # set up processors
         pipeline_reqs_exceptions = []
         for item in self.load_list:
-            processor_name, _, _ = item
+            processor_name, _ = item
             logger.info('Loading: ' + processor_name)
             curr_processor_config = self.filter_config(processor_name, self.config)
             curr_processor_config.update(pipeline_level_configs)
@@ -153,6 +275,8 @@ class Pipeline:
                 # suggest the user try to download the models
                 if 'model_path' in curr_processor_config:
                     model_path = curr_processor_config['model_path']
+                    if e.filename == model_path or (isinstance(model_path, (tuple, list)) and e.filename in model_path):
+                        model_path = e.filename
                     model_dir, model_name = os.path.split(model_path)
                     lang_dir = os.path.dirname(model_dir)
                     if not os.path.exists(lang_dir):
@@ -180,7 +304,8 @@ class Pipeline:
 
     @staticmethod
     def update_kwargs(kwargs, processor_list):
-        processor_dict = {processor: {'package': package, 'dependencies': dependencies} for (processor, package, dependencies) in processor_list}
+        processor_dict = {processor: [{'package': model_spec.package, 'dependencies': model_spec.dependencies} for model_spec in model_specs]
+                          for (processor, model_specs) in processor_list}
         for key, value in kwargs.items():
             pieces = key.split('_', 1)
             if len(pieces) == 1:
@@ -188,9 +313,13 @@ class Pipeline:
             k, v = pieces
             if v == 'model_path':
                 package = value if len(value) < 25 else value[:10]+ '...' + value[-10:]
-                dependencies = processor_dict.get(k, {}).get('dependencies')
-                processor_dict[k] = {'package': package, 'dependencies': dependencies}
-        processor_list = [[processor, processor_dict[processor]['package'], processor_dict[processor]['dependencies']] for processor in processor_dict]
+                original_spec = processor_dict.get(k, [])
+                if len(original_spec) > 0:
+                    dependencies = original_spec[0].get('dependencies')
+                else:
+                    dependencies = None
+                processor_dict[k] = [{'package': package, 'dependencies': dependencies}]
+        processor_list = [(processor, [ModelSpecification(processor=processor, package=model_spec['package'], dependencies=model_spec['dependencies']) for model_spec in processor_dict[processor]]) for processor in processor_dict]
         processor_list = sort_processors(processor_list)
         return processor_list
 
@@ -214,20 +343,45 @@ class Pipeline:
         """
         return [self.processors[processor_name] for processor_name in PIPELINE_NAMES if self.processors.get(processor_name)]
 
-    def process(self, doc):
-        # run the pipeline
+    def process(self, doc, processors=None):
+        """
+        Run the pipeline
+
+        processors: allow for a list of processors used by this pipeline action
+          can be list, tuple, set, or comma separated string
+          if None, use all the processors this pipeline knows about
+          MWT is added if necessary
+          otherwise, no care is taken to make sure prerequisites are followed...
+            some of the annotators, such as depparse, will check, but others
+            will fail in some unusual manner or just have really bad results
+        """
+        assert any([isinstance(doc, str), isinstance(doc, list),
+                    isinstance(doc, Document)]), 'input should be either str, list or Document'
 
         # determine whether we are in bulk processing mode for multiple documents
         bulk=(isinstance(doc, list) and len(doc) > 0 and isinstance(doc[0], Document))
-        for processor_name in PIPELINE_NAMES:
+
+        # various options to limit the processors used by this pipeline action
+        if processors is None:
+            processors = PIPELINE_NAMES
+        elif not isinstance(processors, (str, list, tuple, set)):
+            raise ValueError("Cannot process {} as a list of processors to run".format(type(processors)))
+        else:
+            if isinstance(processors, str):
+                processors = {x for x in processors.split(",")}
+            else:
+                processors = set(processors)
+            if TOKENIZE in processors and MWT in self.processors and MWT not in processors:
+                logger.debug("Requested processors for pipeline did not have mwt, but pipeline needs mwt, so mwt is added")
+                processors.add(MWT)
+            processors = [x for x in PIPELINE_NAMES if x in processors]
+
+        for processor_name in processors:
             if self.processors.get(processor_name):
                 process = self.processors[processor_name].bulk_process if bulk else self.processors[processor_name].process
                 doc = process(doc)
         return doc
 
-    def __call__(self, doc):
-        assert any([isinstance(doc, str), isinstance(doc, list),
-                    isinstance(doc, Document)]), 'input should be either str, list or Document'
-        doc = self.process(doc)
-        return doc
+    def __call__(self, doc, processors=None):
+        return self.process(doc, processors)
 

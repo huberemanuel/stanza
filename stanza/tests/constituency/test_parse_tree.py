@@ -31,7 +31,7 @@ def test_yield_preterminals():
     text = "((S (VP (VB Unban)) (NP (NNP Mox) (NNP Opal))))"
     trees = tree_reader.read_trees(text)
 
-    preterminals = trees[0].preterminals()
+    preterminals = list(trees[0].yield_preterminals())
     assert len(preterminals) == 3
     assert str(preterminals) == "[(VB Unban), (NNP Mox), (NNP Opal)]"
 
@@ -90,6 +90,18 @@ def test_rare_words():
 
     words = Tree.get_rare_words(trees, 0.5)
     expected = ['Who', 'in', 'sits']
+    assert words == expected
+
+def test_common_words():
+    """
+    Test getting the unique words from a tree
+    """
+    text="((SBARQ (WHNP (WP Who)) (SQ (VP (VBZ sits) (PP (IN in) (NP (DT this) (NN seat))))) (. ?)))  ((SBARQ (NP (DT this) (NN seat)) (. ?)))"
+
+    trees = tree_reader.read_trees(text)
+
+    words = Tree.get_common_words(trees, 3)
+    expected = ['?', 'seat', 'this']
     assert words == expected
 
 def test_root_labels():
@@ -194,3 +206,112 @@ def test_equals():
 
     assert tree is not tree2
     assert tree == tree2
+
+
+# This tree was causing the model to barf on CTB7,
+# although it turns out the problem was just the
+# depth of the unary, not the list
+CHINESE_LONG_LIST_TREE = """
+(ROOT
+ (IP
+  (NP (NNP 证券法))
+  (VP
+   (PP
+    (IN 对)
+    (NP
+     (DNP
+      (NP
+       (NP (NNP 中国))
+       (NP
+        (NN 证券)
+        (NN 市场)))
+      (DEC 的))
+     (NP (NN 运作))))
+   (, ，)
+   (PP
+    (PP
+     (IN 从)
+     (NP
+      (NP (NN 股票))
+      (NP (VV 发行) (EC 、) (VV 交易))))
+    (, ，)
+    (PP
+     (VV 到)
+     (NP
+      (NP (NN 上市) (NN 公司) (NN 收购))
+      (EC 、)
+      (NP (NN 证券) (NN 交易所))
+      (EC 、)
+      (NP (NN 证券) (NN 公司))
+      (EC 、)
+      (NP (NN 登记) (NN 结算) (NN 机构))
+      (EC 、)
+      (NP (NN 交易) (NN 服务) (NN 机构))
+      (EC 、)
+      (NP (NN 证券业) (NN 协会))
+      (EC 、)
+      (NP (NN 证券) (NN 监督) (NN 管理) (NN 机构))
+      (CC 和)
+      (NP
+       (DNP
+        (NP (CP (CP (IP (VP (VV 违法))))))
+        (DEC 的))
+       (NP (NN 法律) (NN 责任))))))
+   (ADVP (RB 都))
+   (VP
+    (VV 作)
+    (AS 了)
+    (NP
+     (ADJP (JJ 详细))
+     (NP (NN 规定)))))
+  (. 。)))
+"""
+
+WEIRD_UNARY = """
+  (DNP
+    (NP (CP (CP (IP (VP (ASDF
+      (NP (NN 上市) (NN 公司) (NN 收购))
+      (EC 、)
+      (NP (NN 证券) (NN 交易所))
+      (EC 、)
+      (NP (NN 证券) (NN 公司))
+      (EC 、)
+      (NP (NN 登记) (NN 结算) (NN 机构))
+      (EC 、)
+      (NP (NN 交易) (NN 服务) (NN 机构))
+      (EC 、)
+      (NP (NN 证券业) (NN 协会))
+      (EC 、)
+      (NP (NN 证券) (NN 监督) (NN 管理) (NN 机构))))))))
+    (DEC 的))
+"""
+
+
+def test_count_unaries():
+    trees = tree_reader.read_trees(CHINESE_LONG_LIST_TREE)
+    assert len(trees) == 1
+    assert trees[0].count_unary_depth() == 5
+
+    trees = tree_reader.read_trees(WEIRD_UNARY)
+    assert len(trees) == 1
+    assert trees[0].count_unary_depth() == 5
+
+def test_str_bracket_labels():
+    text = "((S (VP (VB Unban)) (NP (NNP Mox) (NNP Opal))))"
+    expected = "(_ROOT (_S (_VP (_VB Unban )_VB )_VP (_NP (_NNP Mox )_NNP (_NNP Opal )_NNP )_NP )_S )_ROOT"
+
+    trees = tree_reader.read_trees(text)
+    assert len(trees) == 1
+    assert "{:L}".format(trees[0]) == expected
+
+def test_all_leaves_are_preterminals():
+    text = "((S (VP (VB Unban)) (NP (NNP Mox) (NNP Opal))))"
+    trees = tree_reader.read_trees(text)
+    assert len(trees) == 1
+    assert trees[0].all_leaves_are_preterminals()
+
+    text = "((S (VP (VB Unban)) (NP (Mox) (NNP Opal))))"
+    trees = tree_reader.read_trees(text)
+    assert len(trees) == 1
+    assert not trees[0].all_leaves_are_preterminals()
+

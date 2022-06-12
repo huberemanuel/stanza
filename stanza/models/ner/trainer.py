@@ -7,7 +7,9 @@ import logging
 import torch
 from torch import nn
 
+from stanza.models.common.foundation_cache import load_bert
 from stanza.models.common.trainer import Trainer as BaseTrainer
+from stanza.models.common.vocab import VOCAB_PREFIX
 from stanza.models.common import utils, loss
 from stanza.models.ner.model import NERTagger
 from stanza.models.ner.vocab import MultiVocab
@@ -18,44 +20,62 @@ logger = logging.getLogger('stanza')
 def unpack_batch(batch, use_cuda):
     """ Unpack a batch from the data loader. """
     if use_cuda:
-        inputs = [b.cuda() if b is not None else None for b in batch[:6]]
+        inputs = [batch[0]]
+        inputs += [b.cuda() if b is not None else None for b in batch[1:5]]
     else:
-        inputs = batch[:6]
-    orig_idx = batch[6]
-    word_orig_idx = batch[7]
-    char_orig_idx = batch[8]
-    sentlens = batch[9]
-    wordlens = batch[10]
-    charlens = batch[11]
-    charoffsets = batch[12]
+        inputs = batch[:5]
+    orig_idx = batch[5]
+    word_orig_idx = batch[6]
+    char_orig_idx = batch[7]
+    sentlens = batch[8]
+    wordlens = batch[9]
+    charlens = batch[10]
+    charoffsets = batch[11]
     return inputs, orig_idx, word_orig_idx, char_orig_idx, sentlens, wordlens, charlens, charoffsets
 
 def fix_singleton_tags(tags):
     """
-    If there are any singleton B- tags, convert them to S-
+    If there are any singleton B- or E- tags, convert them to S-
     """
     new_tags = list(tags)
+    # first update all I- tags at the start or end of sequence to B- or E- as appropriate
+    for idx, tag in enumerate(new_tags):
+        if (tag.startswith("I-") and
+            (idx == len(new_tags) - 1 or
+             (new_tags[idx+1] != "I-" + tag[2:] and new_tags[idx+1] != "E-" + tag[2:]))):
+            new_tags[idx] = "E-" + tag[2:]
+        if (tag.startswith("I-") and
+            (idx == 0 or
+             (new_tags[idx-1] != "B-" + tag[2:] and new_tags[idx-1] != "I-" + tag[2:]))):
+            new_tags[idx] = "B-" + tag[2:]
+    # now make another pass through the data to update any singleton tags,
+    # including ones which were turned into singletons by the previous operation
     for idx, tag in enumerate(new_tags):
         if (tag.startswith("B-") and
             (idx == len(new_tags) - 1 or
              (new_tags[idx+1] != "I-" + tag[2:] and new_tags[idx+1] != "E-" + tag[2:]))):
+            new_tags[idx] = "S-" + tag[2:]
+        if (tag.startswith("E-") and
+            (idx == 0 or
+             (new_tags[idx-1] != "B-" + tag[2:] and new_tags[idx-1] != "I-" + tag[2:]))):
             new_tags[idx] = "S-" + tag[2:]
     return new_tags
 
 class Trainer(BaseTrainer):
     """ A trainer for training models. """
     def __init__(self, args=None, vocab=None, pretrain=None, model_file=None, use_cuda=False,
-                 train_classifier_only=False):
+                 train_classifier_only=False, foundation_cache=None):
         self.use_cuda = use_cuda
         if model_file is not None:
             # load everything from file
-            self.load(model_file, args)
+            self.load(model_file, args, foundation_cache)
         else:
             assert all(var is not None for var in [args, vocab, pretrain])
             # build model from scratch
             self.args = args
             self.vocab = vocab
-            self.model = NERTagger(args, vocab, emb_matrix=pretrain.emb)
+            self.bert_model, self.bert_tokenizer = load_bert(args['bert_model'], foundation_cache)
+            self.model = NERTagger(args, vocab, emb_matrix=pretrain.emb, bert_model = self.bert_model, bert_tokenizer = self.bert_tokenizer, use_cuda = self.use_cuda)
 
         if train_classifier_only:
             logger.info('Disabling gradient for non-classifier layers')
@@ -72,14 +92,14 @@ class Trainer(BaseTrainer):
 
     def update(self, batch, eval=False):
         inputs, orig_idx, word_orig_idx, char_orig_idx, sentlens, wordlens, charlens, charoffsets = unpack_batch(batch, self.use_cuda)
-        word, word_mask, wordchars, wordchars_mask, chars, tags = inputs
+        word, wordchars, wordchars_mask, chars, tags = inputs
 
         if eval:
             self.model.eval()
         else:
             self.model.train()
             self.optimizer.zero_grad()
-        loss, _, _ = self.model(word, word_mask, wordchars, wordchars_mask, tags, word_orig_idx, sentlens, wordlens, chars, charoffsets, charlens, char_orig_idx)
+        loss, _, _ = self.model(word, wordchars, wordchars_mask, tags, word_orig_idx, sentlens, wordlens, chars, charoffsets, charlens, char_orig_idx)
         loss_val = loss.data.item()
         if eval:
             return loss_val
@@ -91,11 +111,11 @@ class Trainer(BaseTrainer):
 
     def predict(self, batch, unsort=True):
         inputs, orig_idx, word_orig_idx, char_orig_idx, sentlens, wordlens, charlens, charoffsets = unpack_batch(batch, self.use_cuda)
-        word, word_mask, wordchars, wordchars_mask, chars, tags = inputs
+        word, wordchars, wordchars_mask, chars, tags = inputs
 
         self.model.eval()
-        batch_size = word.size(0)
-        _, logits, trans = self.model(word, word_mask, wordchars, wordchars_mask, tags, word_orig_idx, sentlens, wordlens, chars, charoffsets, charlens, char_orig_idx)
+        #batch_size = word.size(0)
+        _, logits, trans = self.model(word, wordchars, wordchars_mask, tags, word_orig_idx, sentlens, wordlens, chars, charoffsets, charlens, char_orig_idx)
 
         # decode
         trans = trans.data.cpu().numpy()
@@ -132,7 +152,7 @@ class Trainer(BaseTrainer):
         except:
             logger.warning("Saving failed... continuing anyway.")
 
-    def load(self, filename, args=None):
+    def load(self, filename, args=None, foundation_cache=None):
         try:
             checkpoint = torch.load(filename, lambda storage, loc: storage)
         except BaseException:
@@ -140,7 +160,24 @@ class Trainer(BaseTrainer):
             raise
         self.args = checkpoint['config']
         if args: self.args.update(args)
+        self.bert_model, self.bert_tokenizer = load_bert(self.args.get('bert_model', None), foundation_cache)
         self.vocab = MultiVocab.load_state_dict(checkpoint['vocab'])
-        self.model = NERTagger(self.args, self.vocab)
+        self.model = NERTagger(self.args, self.vocab, bert_model = self.bert_model, bert_tokenizer = self.bert_tokenizer, use_cuda = self.use_cuda)
         self.model.load_state_dict(checkpoint['model'], strict=False)
 
+    def get_known_tags(self):
+        """
+        Return the tags known by this model
+
+        Removes the S-, B-, etc, and does not include O
+        """
+        tags = set()
+        for tag in self.vocab['tag']:
+            if tag in VOCAB_PREFIX:
+                continue
+            if tag == 'O':
+                continue
+            if len(tag) > 2 and tag[:2] in ('S-', 'B-', 'I-', 'E-'):
+                tag = tag[2:]
+            tags.add(tag)
+        return sorted(tags)

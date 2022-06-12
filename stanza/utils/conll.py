@@ -3,26 +3,14 @@ Utility functions for the loading and conversion of CoNLL-format files.
 """
 import os
 import io
+from zipfile import ZipFile
 
 FIELD_NUM = 10
 
-# TODO: unify this list with the list in common/doc.py
-ID = 'id'
-TEXT = 'text'
-LEMMA = 'lemma'
-UPOS = 'upos'
-XPOS = 'xpos'
-FEATS = 'feats'
-HEAD = 'head'
-DEPREL = 'deprel'
-DEPS = 'deps'
-MISC = 'misc'
-NER = 'ner'
-START_CHAR = 'start_char'
-END_CHAR = 'end_char'
-FIELD_TO_IDX = {ID: 0, TEXT: 1, LEMMA: 2, UPOS: 3, XPOS: 4, FEATS: 5, HEAD: 6, DEPREL: 7, DEPS: 8, MISC: 9}
-
 from stanza.models.common.doc import Document
+from stanza.models.common.doc import ID, TEXT, LEMMA, UPOS, XPOS, FEATS, HEAD, DEPREL, DEPS, MISC, NER, START_CHAR, END_CHAR
+
+FIELD_TO_IDX = {ID: 0, TEXT: 1, LEMMA: 2, UPOS: 3, XPOS: 4, FEATS: 5, HEAD: 6, DEPREL: 7, DEPS: 8, MISC: 9}
 
 class CoNLL:
 
@@ -98,21 +86,29 @@ class CoNLL:
         return token_dict
 
     @staticmethod
-    def conll2dict(input_file=None, input_str=None, ignore_gapping=True):
+    def conll2dict(input_file=None, input_str=None, ignore_gapping=True, zip_file=None):
         """ Load the CoNLL-U format data from file or string into lists of dictionaries.
         """
-        assert any([input_file, input_str]) and not all([input_file, input_str]), 'either input input file or input string'
+        assert any([input_file, input_str]) and not all([input_file, input_str]), 'either use input file or input string'
+        if zip_file: assert input_file, 'must provide input_file if zip_file is set'
+
         if input_str:
             infile = io.StringIO(input_str)
+            doc_conll, doc_comments = CoNLL.load_conll(infile, ignore_gapping)
+        elif zip_file:
+            with ZipFile(zip_file) as zin:
+                with zin.open(input_file) as fin:
+                    doc_conll, doc_comments = CoNLL.load_conll(io.TextIOWrapper(fin, encoding="utf-8"), ignore_gapping)
         else:
-            infile = open(input_file, encoding='utf-8')
-        doc_conll, doc_comments = CoNLL.load_conll(infile, ignore_gapping)
+            with open(input_file, encoding='utf-8') as fin:
+                doc_conll, doc_comments = CoNLL.load_conll(fin, ignore_gapping)
+
         doc_dict = CoNLL.convert_conll(doc_conll)
         return doc_dict, doc_comments
 
     @staticmethod
-    def conll2doc(input_file=None, input_str=None, ignore_gapping=True):
-        doc_dict, doc_comments = CoNLL.conll2dict(input_file, input_str, ignore_gapping)
+    def conll2doc(input_file=None, input_str=None, ignore_gapping=True, zip_file=None):
+        doc_dict, doc_comments = CoNLL.conll2dict(input_file, input_str, ignore_gapping, zip_file=zip_file)
         return Document(doc_dict, text=None, comments=doc_comments)
     
     @staticmethod
@@ -143,9 +139,13 @@ class CoNLL:
         for key in token_dict:
             if key == START_CHAR or key == END_CHAR:
                 misc.append("{}={}".format(key, token_dict[key]))
+            elif key == NER:
+                # TODO: potentially need to escape =|\ in the NER
+                misc.append("{}={}".format(key, token_dict[key]))
             elif key == MISC:
                 # avoid appending a blank misc entry.
                 # otherwise the resulting misc field in the conll doc will wind up being blank text
+                # TODO: potentially need to escape =|\ in the MISC as well
                 if token_dict[key]:
                     misc.append(token_dict[key])
             elif key == ID:

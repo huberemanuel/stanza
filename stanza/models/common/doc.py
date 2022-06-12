@@ -6,6 +6,7 @@ import io
 import re
 import json
 import pickle
+import warnings
 
 from stanza.models.ner.utils import decode_from_bioes
 
@@ -23,6 +24,7 @@ DEPREL = 'deprel'
 DEPS = 'deps'
 MISC = 'misc'
 NER = 'ner'
+MULTI_NER = 'multi_ner'     # will represent tags from multiple NER models
 START_CHAR = 'start_char'
 END_CHAR = 'end_char'
 TYPE = 'type'
@@ -158,14 +160,35 @@ class Document(StanzaObject):
             self.sentences.append(sentence)
             begin_idx, end_idx = sentence.tokens[0].start_char, sentence.tokens[-1].end_char
             if all((self.text is not None, begin_idx is not None, end_idx is not None)): sentence.text = self.text[begin_idx: end_idx]
-            sentence.id = sent_idx
+            sentence.index = sent_idx
 
         self._count_words()
 
-        if comments:
-            for sentence, sentence_comments in zip(self.sentences, comments):
+        # Add a #text comment to each sentence in a doc if it doesn't already exist
+        if not comments:
+            comments = [[] for x in self.sentences]
+        else:
+            comments = [list(x) for x in comments]
+        for sentence, sentence_comments in zip(self.sentences, comments):
+            if sentence.text and not any(x.startswith("# text") or x.startswith("#text") for x in sentence_comments):
+                # split/join to handle weird whitespace, especially newlines
+                sentence_comments.append("# text = " + ' '.join(sentence.text.split()))
+            elif not sentence.text:
                 for comment in sentence_comments:
-                    sentence.add_comment(comment)
+                    if comment.startswith("# text ="):
+                        sentence.text = comment.split("=", 1)[-1].strip()
+                        break
+            # look for sent_id in the comments
+            # if it's there, overwrite the sent_idx id from above
+            for comment in sentence_comments:
+                if comment.startswith("# sent_id"):
+                    sentence.sent_id = comment.split("=", 1)[-1].strip()
+                    break
+            else: # no sent_id found.  add a comment with our enumerated id
+                sentence.sent_id = str(sentence.index)
+                sentence_comments.append("# sent_id = " + sentence.sent_id)
+            for comment in sentence_comments:
+                sentence.add_comment(comment)
 
     def _count_words(self):
         """
@@ -416,14 +439,46 @@ class Sentence(StanzaObject):
         self.rebuild_dependencies()
 
     @property
+    def index(self):
+        """
+        Access the index of this sentence within the doc.
+
+        If multiple docs were processed together,
+        the sentence index will continue counting across docs.
+        """
+        return self._index
+
+    @index.setter
+    def index(self, value):
+        """ Set the sentence's index value. """
+        self._index = value
+
+    @property
     def id(self):
-        """ Access the index of this sentence.  Indexed from 1 to match tokens """
-        return self._id
+        """
+        Access the index of this sentence within the doc.
+
+        If multiple docs were processed together,
+        the sentence index will continue counting across docs.
+        """
+        warnings.warn("Use of sentence.id is deprecated.  Please use sentence.index instead", stacklevel=2)
+        return self._index
 
     @id.setter
     def id(self, value):
-        """ Set the sentence's id value. """
-        self._id = value
+        """ Set the sentence's index value. """
+        warnings.warn("Use of sentence.id is deprecated.  Please use sentence.index instead", stacklevel=2)
+        self._index = value
+
+    @property
+    def sent_id(self):
+        """ conll-style sent_id  Will be set from index if unknown """
+        return self._sent_id
+
+    @sent_id.setter
+    def sent_id(self, value):
+        """ Set the sentence's sent_id value. """
+        self._sent_id = value
 
     @property
     def doc(self):
@@ -619,6 +674,9 @@ def init_from_misc(unit):
             if hasattr(unit, attr):
                 setattr(unit, attr, value)
                 continue
+            elif key == NER:
+                # special case skipping NER for Words, since there is no Word NER field
+                continue
         remaining_values.append(item)
     unit._misc = "|".join(remaining_values)
 
@@ -637,6 +695,7 @@ class Token(StanzaObject):
         assert self._id and self._text, 'id and text should be included for the token'
         self._misc = token_entry.get(MISC, None)
         self._ner = token_entry.get(NER, None)
+        self._multi_ner = token_entry.get(MULTI_NER, None)
         self._words = words if words is not None else []
         self._start_char = token_entry.get(START_CHAR, None)
         self._end_char = token_entry.get(END_CHAR, None)
@@ -708,6 +767,16 @@ class Token(StanzaObject):
         self._ner = value if self._is_null(value) == False else None
 
     @property
+    def multi_ner(self):
+        """ Access the MULTI_NER tag of this token. Example: '(B-ORG, B-DISEASE)'"""
+        return self._multi_ner
+
+    @multi_ner.setter
+    def multi_ner(self, value):
+        """ Set the token's MULTI_NER tag. Example: '(B-ORG, B-DISEASE)'"""
+        self._multi_ner = value if self._is_null(value) == False else None
+
+    @property
     def sent(self):
         """ Access the pointer to the sentence that this token belongs to. """
         return self._sent
@@ -720,7 +789,7 @@ class Token(StanzaObject):
     def __repr__(self):
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
-    def to_dict(self, fields=[ID, TEXT, NER, MISC, START_CHAR, END_CHAR]):
+    def to_dict(self, fields=[ID, TEXT, MISC, START_CHAR, END_CHAR, NER, MULTI_NER]):
         """ Dumps the token into a list of dictionary for this token with its extended words
         if the token is a multi-word token.
         """
@@ -735,6 +804,8 @@ class Token(StanzaObject):
             word_dict = word.to_dict()
             if len(self.id) == 1 and NER in fields and getattr(self, NER) is not None: # propagate NER label to Word if it is a single-word token
                 word_dict[NER] = getattr(self, NER)
+            if len(self.id) == 1 and MULTI_NER in fields and getattr(self, MULTI_NER) is not None: # propagate MULTI_NER label to Word if it is a single-word token
+                word_dict[MULTI_NER] = getattr(self, MULTI_NER)
             ret.append(word_dict)
         return ret
 

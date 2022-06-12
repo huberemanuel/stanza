@@ -22,8 +22,6 @@ class TransitionScheme(Enum):
 
     IN_ORDER           = 4
 
-UNARY_LIMIT = 4
-
 class State(namedtuple('State', ['word_queue', 'transitions', 'constituents', 'gold_tree', 'gold_sequence',
                                  'sentence_length', 'num_opens', 'word_position'])):
     """
@@ -100,7 +98,7 @@ class State(namedtuple('State', ['word_queue', 'transitions', 'constituents', 'g
         return [model.get_word(x) for x in self.word_queue]
 
     def to_string(self, model):
-        return "State(\n  buffer:%s\n  transitions:%s\n  constituents:%s)" % (str(self.all_words(model)), str(self.all_transitions(model)), str(self.all_constituents(model)))
+        return "State(\n  buffer:%s\n  transitions:%s\n  constituents:%s\n  word_position:%d num_opens:%d)" % (str(self.all_words(model)), str(self.all_transitions(model)), str(self.all_constituents(model)), self.word_position, self.num_opens)
 
     def __str__(self):
         return "State(\n  buffer:%s\n  transitions:%s\n  constituents:%s)" % (str(self.word_queue), str(self.transitions), str(self.constituents))
@@ -127,21 +125,13 @@ def initial_state_from_preterminals(preterminal_lists, model, gold_trees):
     return states
 
 def initial_state_from_words(word_lists, model):
-    # TODO: stop reversing the words
-    preterminal_lists = []
-    for words in word_lists:
-        preterminals = []
-        for word, tag in reversed(words):
-            word_node = Tree(label=word)
-            tag_node = Tree(label=tag, children=[word_node])
-            preterminals.append(tag_node)
-        preterminal_lists.append(preterminals)
+    preterminal_lists = [[Tree(tag, Tree(word)) for word, tag in words]
+                         for words in word_lists]
     return initial_state_from_preterminals(preterminal_lists, model, gold_trees=None)
 
 def initial_state_from_gold_trees(trees, model):
-    # reversed so we put the words on the stack backwards
-    preterminal_lists = [[Tree(label=pt.label, children=Tree(label=pt.children[0].label))
-                          for pt in tree.yield_reversed_preterminals()]
+    preterminal_lists = [[Tree(pt.label, Tree(pt.children[0].label))
+                          for pt in tree.yield_preterminals()]
                          for tree in trees]
     return initial_state_from_preterminals(preterminal_lists, model, gold_trees=trees)
 
@@ -169,7 +159,6 @@ class Transition(ABC):
               and itself.  this allows a batch operation to build
               the constituent
         """
-        pass
 
     def delta_opens(self):
         return 0
@@ -177,16 +166,12 @@ class Transition(ABC):
     def apply(self, state, model):
         """
         return a new State transformed via this transition
-        """
-        word_position, constituents, new_constituent, callback = self.update_state(state, model)
-        if callback is not None:
-            new_constituent = callback.build_constituents(model, [new_constituent])[0]
-        constituents = model.push_constituents([constituents], [new_constituent])[0]
 
-        return state._replace(num_opens=state.num_opens + self.delta_opens(),
-                              word_position=word_position,
-                              transitions=model.push_transitions([state.transitions], [self])[0],
-                              constituents=constituents)
+        convenience method to call bulk_apply, which is significantly
+        faster than single operations for an NN based model
+        """
+        update = bulk_apply(model, [state], [self])
+        return update[0]
 
     @abstractmethod
     def is_legal(self, state, model):
@@ -195,7 +180,12 @@ class Transition(ABC):
 
         at parse time, the parser might choose a transition which cannot be made
         """
-        pass
+
+    @abstractmethod
+    def short_name(self):
+        """
+        A short name to identify this transition
+        """
 
     def __lt__(self, other):
         # put the Shift at the front of a list, and otherwise sort alphabetically
@@ -257,6 +247,9 @@ class Shift(Transition):
                     return False
         return True
 
+    def short_name(self):
+        return "Shift"
+
     def __repr__(self):
         return "Shift"
 
@@ -306,6 +299,9 @@ class CompoundUnary(Transition):
         else:
             return is_root
 
+    def short_name(self):
+        return "Unary"
+
     def __repr__(self):
         return "CompoundUnary(%s)" % ",".join(self.labels)
 
@@ -343,7 +339,7 @@ class Dummy():
     def __hash__(self):
         return hash(self.label)
 
-def too_many_unary_nodes(tree):
+def too_many_unary_nodes(tree, unary_limit):
     """
     Return True iff there are UNARY_LIMIT unary nodes in a tree in a row
 
@@ -352,7 +348,7 @@ def too_many_unary_nodes(tree):
     """
     if tree is None:
         return False
-    for _ in range(UNARY_LIMIT + 1):
+    for _ in range(unary_limit + 1):
         if len(tree.children) != 1:
             return False
         tree = tree.children[0]
@@ -418,7 +414,7 @@ class OpenConstituent(Transition):
                 # nodes under one root
                 return state.num_opens == 0 and state.empty_word_queue()
             else:
-                if (state.num_opens > 0 or state.empty_word_queue()) and too_many_unary_nodes(model.get_top_constituent(state.constituents)):
+                if (state.num_opens > 0 or state.empty_word_queue()) and too_many_unary_nodes(model.get_top_constituent(state.constituents), model.unary_limit()):
                     # looks like we've been in a loop of lots of unary transitions
                     # note that we check `num_opens > 0` because otherwise we might wind up stuck
                     # in a state where the only legal transition is open, such as if the
@@ -430,6 +426,9 @@ class OpenConstituent(Transition):
                     return False
                 return True
         return True
+
+    def short_name(self):
+        return "Open"
 
     def __repr__(self):
         return "OpenConstituent({})".format(self.label)
@@ -475,7 +474,14 @@ class CloseConstituent(Transition):
 
     @staticmethod
     def build_constituents(model, data):
-        labels, children_lists = list(map(list, zip(*data)))
+        """
+        builds new constituents out of the incoming data
+
+        data is a list of tuples: (label, children)
+        the model will batch the build operation
+        again, the purpose of this batching is to do multiple deep learning operations at once
+        """
+        labels, children_lists = map(list, zip(*data))
         new_constituents = model.build_constituents(labels, children_lists)
         return new_constituents
 
@@ -514,7 +520,7 @@ class CloseConstituent(Transition):
                 # if we're stuck in a loop of unaries
                 return True
             node = model.get_top_constituent(state.constituents.pop())
-            if too_many_unary_nodes(node):
+            if too_many_unary_nodes(node, model.unary_limit()):
                 # at this point, we are in a situation where
                 # - multiple unaries have happened in a row
                 # - there is stuff on the word_queue, so a ROOT open isn't legal
@@ -524,6 +530,9 @@ class CloseConstituent(Transition):
                 # this node, so instead we make the Close illegal
                 return False
         return True
+
+    def short_name(self):
+        return "Close"
 
     def __repr__(self):
         return "CloseConstituent"
@@ -538,7 +547,15 @@ class CloseConstituent(Transition):
     def __hash__(self):
         return hash(93)
 
-def bulk_apply(model, tree_batch, transitions, fail=False, max_transitions=1000):
+def bulk_apply(model, tree_batch, transitions, fail=False):
+    """
+    Apply the given list of Transitions to the given list of States, using the model as a reference
+
+    model: SimpleModel, LSTMModel, or any other form of model
+    tree_batch: list of States (legacy name)
+    transitions: list of transitions
+    fail: throw an exception on a failed transition, as opposed to skipping the tree
+    """
     remove = set()
 
     word_positions = []
@@ -556,8 +573,11 @@ def bulk_apply(model, tree_batch, transitions, fail=False, max_transitions=1000)
                 remove.add(idx)
                 continue
 
-        if max_transitions and tree.num_transitions() >= max_transitions:
+        if tree.num_transitions() >= len(tree.word_queue) * 20:
             # too many transitions
+            # x20 is somewhat empirically chosen based on certain
+            # treebanks having deep unary structures, especially early
+            # on when the model is fumbling around
             if tree.gold_tree:
                 error = "Went infinite on the following gold tree:\n{}\n\nFinal state:\n{}".format(tree.gold_tree, tree.to_string(model))
             else:

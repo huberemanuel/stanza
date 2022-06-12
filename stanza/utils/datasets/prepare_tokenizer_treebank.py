@@ -34,6 +34,7 @@ from collections import Counter
 
 import stanza.utils.datasets.common as common
 import stanza.utils.datasets.prepare_tokenizer_data as prepare_tokenizer_data
+import stanza.utils.datasets.tokenization.convert_my_alt as convert_my_alt
 import stanza.utils.datasets.tokenization.convert_vi_vlsp as convert_vi_vlsp
 import stanza.utils.datasets.tokenization.convert_th_best as convert_th_best
 import stanza.utils.datasets.tokenization.convert_th_lst20 as convert_th_lst20
@@ -806,15 +807,6 @@ def build_combined_italian_dataset(udbase_dir, tokenizer_dir, handparsed_dir, sh
         for treebank in treebanks:
             conllu_file = common.find_treebank_dataset_file(treebank, udbase_dir, dataset, "conllu", fail=True)
             sents.extend(read_sentences_from_conllu(conllu_file))
-        extra_italian = os.path.join(handparsed_dir, "italian-mwt", "italian.mwt")
-        if not os.path.exists(extra_italian):
-            raise FileNotFoundError("Cannot find the extra dataset 'italian.mwt' which includes various multi-words retokenized, expected {}".format(extra_italian))
-        extra_sents = read_sentences_from_conllu(extra_italian)
-        for sentence in extra_sents:
-            if not sentence[2].endswith("_") or not MWT_RE.match(sentence[2]):
-                raise AssertionError("Unexpected format of the italian.mwt file.  Has it already be modified to have SpaceAfter=No everywhere?")
-            sentence[2] = sentence[2][:-1] + "SpaceAfter=No"
-        sents = sents + extra_sents
     else:
         istd_conllu = common.find_treebank_dataset_file("UD_Italian-ISDT", udbase_dir, dataset, "conllu")
         sents = read_sentences_from_conllu(istd_conllu)
@@ -828,9 +820,7 @@ def check_gum_ready(udbase_dir):
 
 def build_combined_english_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset):
     """
-    en_combined is currently EWT, GUM, PUD, and Pronouns
-
-    TODO: use more of the handparsed data
+    en_combined is currently EWT, GUM, PUD, Pronouns, and handparsed
     """
     check_gum_ready(udbase_dir)
 
@@ -855,6 +845,31 @@ def build_combined_english_dataset(udbase_dir, tokenizer_dir, handparsed_dir, sh
     sents = strip_mwt_from_sentences(sents)
     return sents
 
+def build_extra_combined_english_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset):
+    """
+    Extra sentences we don't want augmented
+    """
+    sents = []
+    if dataset == 'train':
+        sents.extend(read_sentences_from_conllu(os.path.join(handparsed_dir, "english-handparsed", "english.conll")))
+    return sents
+
+def build_extra_combined_italian_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset):
+    """
+    Extra data - the MWT data for Italian
+    """
+    if dataset != 'train':
+        return []
+
+    extra_italian = os.path.join(handparsed_dir, "italian-mwt", "italian.mwt")
+    if not os.path.exists(extra_italian):
+        raise FileNotFoundError("Cannot find the extra dataset 'italian.mwt' which includes various multi-words retokenized, expected {}".format(extra_italian))
+    extra_sents = read_sentences_from_conllu(extra_italian)
+    for sentence in extra_sents:
+        if not sentence[2].endswith("_") or not MWT_RE.match(sentence[2]):
+            raise AssertionError("Unexpected format of the italian.mwt file.  Has it already be modified to have SpaceAfter=No everywhere?")
+        sentence[2] = sentence[2][:-1] + "SpaceAfter=No"
+    return extra_sents
 
 def replace_semicolons(sentences):
     """
@@ -919,14 +934,46 @@ COMBINED_FNS = {
     "it_combined": build_combined_italian_dataset,
 }
 
+# some extra data for the combined models without augmenting
+COMBINED_EXTRA_FNS = {
+    "en_combined": build_extra_combined_english_dataset,
+    "it_combined": build_extra_combined_italian_dataset,
+}
+
 def build_combined_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, augment):
     random.seed(1234)
     build_fn = COMBINED_FNS[short_name]
+    extra_fn = COMBINED_EXTRA_FNS.get(short_name, None)
     for dataset in ("train", "dev", "test"):
         output_conllu = f"{tokenizer_dir}/{short_name}.{dataset}.gold.conllu"
         sents = build_fn(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset)
         if dataset == 'train' and augment:
             sents = augment_punct(sents)
+        if extra_fn is not None:
+            sents.extend(extra_fn(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset))
+        write_sentences_to_conllu(output_conllu, sents)
+
+BIO_DATASETS = ("en_craft", "en_genia", "en_mimic")
+
+def build_bio_dataset(paths, udbase_dir, tokenizer_dir, handparsed_dir, short_name, augment):
+    """
+    Process the en bio datasets
+
+    Creates a dataset by combining the en_combined data with one of the bio sets
+    """
+    random.seed(1234)
+    name, bio_dataset = short_name.split("_")
+    assert name == 'en'
+    for dataset in ("train", "dev", "test"):
+        output_conllu = f"{tokenizer_dir}/{short_name}.{dataset}.gold.conllu"
+        if dataset == 'train':
+            sents = build_combined_english_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, dataset)
+            if dataset == 'train' and augment:
+                sents = augment_punct(sents)
+        else:
+            sents = []
+        bio_file = os.path.join(paths["BIO_UD_DIR"], "UD_English-%s" % bio_dataset.upper(), "en_%s-ud-%s.conllu" % (bio_dataset.lower(), dataset))
+        sents.extend(read_sentences_from_conllu(bio_file))
         write_sentences_to_conllu(output_conllu, sents)
 
 def build_combined_english_gum_dataset(udbase_dir, tokenizer_dir, short_name, dataset, augment):
@@ -1024,6 +1071,7 @@ def add_specific_args(parser):
     convert_th_lst20.add_lst20_args(parser)
 
     convert_vi_vlsp.add_vlsp_args(parser)
+
 def process_treebank(treebank, paths, args):
     """
     Processes a single treebank into train, dev, test parts
@@ -1043,7 +1091,9 @@ def process_treebank(treebank, paths, args):
 
     os.makedirs(tokenizer_dir, exist_ok=True)
 
-    if short_name == "vi_vlsp":
+    if short_name == "my_alt":
+        convert_my_alt.convert_my_alt(paths["CONSTITUENCY_BASE"], tokenizer_dir)
+    elif short_name == "vi_vlsp":
         convert_vi_vlsp.convert_vi_vlsp(paths["EXTERN_DIR"], tokenizer_dir, args)
     elif short_name == "th_orchid":
         convert_th_orchid.main(paths["EXTERN_DIR"], tokenizer_dir)
@@ -1053,8 +1103,10 @@ def process_treebank(treebank, paths, args):
         convert_th_best.main(paths["EXTERN_DIR"], tokenizer_dir)
     elif short_name.startswith("ko_combined"):
         build_combined_korean(udbase_dir, tokenizer_dir, short_name)
-    elif short_name in ("it_combined", "en_combined", "es_combined"):
+    elif short_name in COMBINED_FNS: # eg "it_combined", "en_combined", etc
         build_combined_dataset(udbase_dir, tokenizer_dir, handparsed_dir, short_name, args.augment)
+    elif short_name in BIO_DATASETS:
+        build_bio_dataset(paths, udbase_dir, tokenizer_dir, handparsed_dir, short_name, args.augment)
     elif short_name.startswith("en_gum"):
         # we special case GUM because it should include a filled-out GUMReddit
         print("Preparing data for %s: %s, %s" % (treebank, short_name, short_language))

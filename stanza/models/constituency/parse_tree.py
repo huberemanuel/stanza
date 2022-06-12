@@ -4,6 +4,7 @@ Tree datastructure
 
 from collections import deque, Counter
 from io import StringIO
+import itertools
 import re
 
 from stanza.models.common.doc import StanzaObject
@@ -17,6 +18,11 @@ EMPTY_CHILDREN = ()
 
 CONSTITUENT_SPLIT = re.compile("[-=#]")
 
+# These words occur in the VLSP dataset.
+# The documentation claims there might be *O*, although those don't
+# seem to exist in practice
+WORDS_TO_PRUNE = ('*E*', '*T*', '*O*')
+
 class Tree(StanzaObject):
     """
     A data structure to represent a parse tree
@@ -27,7 +33,7 @@ class Tree(StanzaObject):
         elif isinstance(children, Tree):
             self.children = (children,)
         else:
-            self.children = children
+            self.children = tuple(children)
 
         self.label = label
 
@@ -37,67 +43,105 @@ class Tree(StanzaObject):
     def is_preterminal(self):
         return len(self.children) == 1 and len(self.children[0].children) == 0
 
-    def yield_reversed_preterminals(self):
+    def yield_preterminals(self):
         """
-        Yield the preterminals one at a time in BACKWARDS order
+        Yield the preterminals one at a time in order
+        """
+        if self.is_preterminal():
+            yield self
+            return
 
-        This is done reversed as it is a frequently used method in the
-        parser, so this is a tiny optimization
-        """
-        nodes = deque()
-        nodes.append(self)
-        while len(nodes) > 0:
-            node = nodes.pop()
-            if len(node.children) == 0:
-                raise ValueError("Got called with an unexpected tree layout: {}".format(self))
-            elif node.is_preterminal():
+        if self.is_leaf():
+            raise ValueError("Attempted to iterate preterminals on non-internal node")
+
+        iterator = iter(self.children)
+        node = next(iterator, None)
+        while node is not None:
+            if node.is_preterminal():
                 yield node
             else:
-                nodes.extend(node.children)
+                iterator = itertools.chain(node.children, iterator)
+            node = next(iterator, None)
 
     def leaf_labels(self):
         """
         Get the labels of the leaves
-
-        Not optimized whatsoever - current not an important part of
-        the parser
         """
-        preterminals = reversed([x for x in self.yield_reversed_preterminals()])
-        words = [x.children[0].label for x in preterminals]
+        words = [x.children[0].label for x in self.yield_preterminals()]
         return words
 
-    def preterminals(self):
-        return list(reversed(list(self.yield_reversed_preterminals())))
+    def all_leaves_are_preterminals(self):
+        """
+        Returns True if all leaves are under preterminals, False otherwise
+        """
+        if self.is_leaf():
+            return False
 
-    def __repr__(self):
+        if self.is_preterminal():
+            return True
+
+        return all(t.all_leaves_are_preterminals() for t in self.children)
+
+    def __format__(self, spec):
         """
         Turn the tree into a string representing the tree
 
         Note that this is not a recursive traversal
         Otherwise, a tree too deep might blow up the call stack
+
+        There is a type specific format:
+          L  -> open and close brackets are labeled, spaces in the tokens are replaced with _
+          ?  -> spaces in the tokens are replaced with ? for any non-L value of ?
+          ?L -> bracket labels AND a custom space replacement
         """
+        space_replacement = " "
+        bracket_labels = False
+        if spec == 'L':
+            bracket_labels = True
+            space_replacement = "_"
+        elif spec and spec[-1] == 'L':
+            bracket_labels = True
+            space_replacement = spec[0]
+        elif spec:
+            space_replacement = spec[0]
+
+        def normalize(text):
+            return text.replace(" ", space_replacement).replace("(", "-LRB-").replace(")", "-RRB-")
+
         with StringIO() as buf:
             stack = deque()
             stack.append(self)
             while len(stack) > 0:
                 node = stack.pop()
-                # note that == can recursively call == in some circumstances!
-                if node is CLOSE_PAREN or node is SPACE_SEPARATOR:
+                if isinstance(node, str):
                     buf.write(node)
                     continue
                 if len(node.children) == 0:
                     if node.label is not None:
-                        buf.write(node.label)
+                        buf.write(normalize(node.label))
                     continue
-                buf.write(OPEN_PAREN)
-                if node.label is not None:
-                    buf.write(node.label)
-                stack.append(CLOSE_PAREN)
+
+                if bracket_labels:
+                    buf.write("%s_%s" % (OPEN_PAREN, normalize(node.label)))
+                else:
+                    buf.write(OPEN_PAREN)
+                    if node.label is not None:
+                        buf.write(normalize(node.label))
+
+                if bracket_labels:
+                    stack.append(CLOSE_PAREN + "_" + normalize(node.label))
+                    stack.append(SPACE_SEPARATOR)
+                else:
+                    stack.append(CLOSE_PAREN)
+
                 for child in reversed(node.children):
                     stack.append(child)
                     stack.append(SPACE_SEPARATOR)
             buf.seek(0)
             return buf.read()
+
+    def __repr__(self):
+        return "{}".format(self)
 
     def __eq__(self, other):
         if self is other:
@@ -147,13 +191,21 @@ class Tree(StanzaObject):
         """
         Walks over all of the trees and gets all of the unique constituent names from the trees
         """
+        constituents = Tree.get_constituent_counts(trees)
+        return sorted(set(constituents.keys()))
+
+    @staticmethod
+    def get_constituent_counts(trees):
+        """
+        Walks over all of the trees and gets the count of the unique constituent names from the trees
+        """
         if isinstance(trees, Tree):
             trees = [trees]
 
-        constituents = set()
+        constituents = Counter()
         for tree in trees:
-            tree.visit_preorder(internal = lambda x: constituents.add(x.label))
-        return sorted(constituents)
+            tree.visit_preorder(internal = lambda x: constituents.update([x.label]))
+        return constituents
 
     @staticmethod
     def get_unique_tags(trees):
@@ -180,6 +232,22 @@ class Tree(StanzaObject):
         for tree in trees:
             tree.visit_preorder(leaf = lambda x: words.add(x.label))
         return sorted(words)
+
+    @staticmethod
+    def get_common_words(trees, num_words):
+        """
+        Walks over all of the trees and gets the most frequently occurring words.
+        """
+        if num_words == 0:
+            return set()
+
+        if isinstance(trees, Tree):
+            trees = [trees]
+
+        words = Counter()
+        for tree in trees:
+            tree.visit_preorder(leaf = lambda x: words.update([x.label]))
+        return sorted(x[0] for x in words.most_common()[:num_words])
 
     @staticmethod
     def get_rare_words(trees, threshold=0.05):
@@ -279,7 +347,7 @@ class Tree(StanzaObject):
 
         new_tree = recursive_replace_words(self)
         if any(True for _ in word_iterator):
-            raise ValueError("Too many tags for the given tree")
+            raise ValueError("Too many words for the given tree")
         return new_tree
 
 
@@ -287,12 +355,13 @@ class Tree(StanzaObject):
         """
         Return a copy of the tree, eliminating all nodes which are in one of two categories:
             they are a preterminal -NONE-, such as appears in PTB
+              *E* shows up in a VLSP dataset
             they have been pruned to 0 children by the recursive call
         """
         if self.is_leaf():
             return Tree(self.label)
         if self.is_preterminal():
-            if self.label == '-NONE-':
+            if self.label == '-NONE-' or self.children[0].label in WORDS_TO_PRUNE:
                 return None
             return Tree(self.label, Tree(self.children[0].label))
         # must be internal node
@@ -301,3 +370,25 @@ class Tree(StanzaObject):
         if len(new_children) == 0:
             return None
         return Tree(self.label, new_children)
+
+    def count_unary_depth(self):
+        if self.is_preterminal() or self.is_leaf():
+            return 0
+        if len(self.children) == 1:
+            t = self
+            score = 0
+            while not t.is_preterminal() and not t.is_leaf() and len(t.children) == 1:
+                score = score + 1
+                t = t.children[0]
+            child_score = max(tc.count_unary_depth() for tc in t.children)
+            score = max(score, child_score)
+            return score
+        score = max(t.count_unary_depth() for t in self.children)
+        return score
+
+    @staticmethod
+    def write_treebank(trees, out_file, fmt="{}"):
+        with open(out_file, "w", encoding="utf-8") as fout:
+            for tree in trees:
+                fout.write(fmt.format(tree))
+                fout.write("\n")

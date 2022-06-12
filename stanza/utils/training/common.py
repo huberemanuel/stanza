@@ -1,15 +1,15 @@
 import argparse
+import glob
 import logging
 import os
 import pathlib
-import re
-import subprocess
 import sys
 import tempfile
 
 from enum import Enum
 
 from stanza.models.common.constant import treebank_to_short_name
+from stanza.resources.common import download, DEFAULT_MODEL_DIR
 from stanza.utils.datasets import common
 import stanza.utils.default_paths as default_paths
 from stanza.utils import conll18_ud_eval as ud_eval
@@ -20,6 +20,71 @@ class Mode(Enum):
     TRAIN = 1
     SCORE_DEV = 2
     SCORE_TEST = 3
+
+BERT = {
+    # https://huggingface.co/Maltehb/danish-bert-botxo
+    # contrary to normal expectations, this hurts F1
+    # on a dev split by about 1 F1
+    # "da": "Maltehb/danish-bert-botxo",
+    #
+    # the multilingual bert is a marginal improvement for conparse
+    "da": "bert-base-multilingual-cased",
+
+    # https://huggingface.co/roberta-base
+    "en": "roberta-base",
+
+    # NER scores for a couple options:
+    # none:
+    # dev:  2022-03-04 INFO: fi_turku 83.45
+    # test: 2022-03-04 INFO: fi_turku 86.25
+    #
+    # bert-base-multilingual-cased
+    # dev:  2022-03-04 INFO: fi_turku 85.23
+    # test: 2022-03-04 INFO: fi_turku 89.00
+    #
+    # TurkuNLP/bert-base-finnish-cased-v1:
+    # dev:  2022-03-04 INFO: fi_turku 88.41
+    # test: 2022-03-04 INFO: fi_turku 91.36
+    "fi": "TurkuNLP/bert-base-finnish-cased-v1",
+
+    # from https://github.com/idb-ita/GilBERTo
+    # annoyingly, it doesn't handle cased text
+    # supposedly there is an argument "do_lower_case"
+    # but that still leaves a lot of unk tokens
+    # "it": "idb-ita/gilberto-uncased-from-camembert",
+    #
+    # from https://github.com/musixmatchresearch/umberto
+    # on NER, this gets 88.37 dev and 91.02 test
+    # another option is dbmdz/bert-base-italian-cased,
+    # which gets 87.27 dev and 90.32 test
+    "it": "Musixmatch/umberto-commoncrawl-cased-v1",
+
+    # experiments on the cintil conparse dataset
+    # ran a variety of transformer settings
+    # found the following dev set scores after 400 iterations:
+    # Geotrend/distilbert-base-pt-cased : not plug & play
+    # no bert: 0.9082
+    # xlm-roberta-base: 0.9109
+    # xlm-roberta-large: 0.9254
+    # adalbertojunior/distilbert-portuguese-cased: 0.9300
+    # neuralmind/bert-base-portuguese-cased: 0.9307
+    # neuralmind/bert-large-portuguese-cased: 0.9343
+    "pt": "neuralmind/bert-large-portuguese-cased",
+
+    # https://huggingface.co/dbmdz/bert-base-turkish-128k-cased
+    # helps the Turkish model quite a bit
+    "tr": "dbmdz/bert-base-turkish-128k-cased",
+
+    # from https://github.com/VinAIResearch/PhoBERT
+    # "vi": "vinai/phobert-base",
+    # another option is phobert-large, but that doesn't
+    # change the scores any
+    "vi": "vinai/phobert-large",
+
+    # https://github.com/ymcui/Chinese-BERT-wwm
+    # there's also hfl/chinese-roberta-wwm-ext-large
+    "zh-hans": "hfl/chinese-roberta-wwm-ext",
+}
 
 def build_argparse():
     parser = argparse.ArgumentParser()
@@ -37,14 +102,16 @@ def build_argparse():
     parser.add_argument('--force', dest='force', action='store_true', default=False, help='Retrain existing models')
     return parser
 
-SHORTNAME_RE = re.compile("[a-z-]+_[a-z0-9]+")
-
 def main(run_treebank, model_dir, model_name, add_specific_args=None):
     """
     A main program for each of the run_xyz scripts
 
     It collects the arguments and runs the main method for each dataset provided.
     It also tries to look for an existing model and not overwrite it unless --force is provided
+
+    model_name can be a callable expecting the args
+      - the charlm, for example, needs this feature, since it makes
+        both forward and backward models
     """
     logger.info("Training program called with:\n" + " ".join(sys.argv))
 
@@ -63,6 +130,9 @@ def main(run_treebank, model_dir, model_name, add_specific_args=None):
     # Pass this through to the underlying model as well as use it here
     if command_args.save_dir:
         extra_args.extend(["--save_dir", command_args.save_dir])
+
+    if callable(model_name):
+        model_name = model_name(command_args)
 
     mode = command_args.mode
     treebanks = []
@@ -83,10 +153,7 @@ def main(run_treebank, model_dir, model_name, add_specific_args=None):
         if treebank_idx > 0:
             logger.info("=========================================")
 
-        if SHORTNAME_RE.match(treebank):
-            short_name = treebank
-        else:
-            short_name = treebank_to_short_name(treebank)
+        short_name = treebank_to_short_name(treebank)
         logger.debug("%s: %s" % (treebank, short_name))
 
         if mode == Mode.TRAIN and not command_args.force and model_name != 'ete':
@@ -131,3 +198,95 @@ def run_eval_script_pos(eval_gold, eval_pred):
 
 def run_eval_script_depparse(eval_gold, eval_pred):
     return run_eval_script(eval_gold, eval_pred, evals=["UAS", "LAS", "CLAS", "MLAS", "BLEX"])
+
+
+def find_wordvec_pretrain(language, default_pretrain):
+    pretrain_path = '{}/{}/pretrain/*.pt'.format(DEFAULT_MODEL_DIR, language)
+    pretrains = glob.glob(pretrain_path)
+    if len(pretrains) == 0:
+        # TODO: try to extract/remember the specific pretrain for the given model
+        # That would be a good way to archive which pretrains are used for which NER models, anyway
+        # For now, just download the default and use that
+        pretrain_package = default_pretrain.get(language, None)
+        if pretrain_package is None:
+            logger.warning(f"Cannot figure out which pretrain to use for '{language}'.  Will download the default package and hope for the best")
+            download(lang=language)
+        else:
+            logger.warning(f"Missing pretrain for '{language}'.  Will download the default pretrain '{pretrain_package}'")
+            download(lang=language, package=None, processors={"pretrain": pretrain_package})
+        pretrains = glob.glob(pretrain_path)
+    if len(pretrains) == 0:
+        raise FileNotFoundError(f"Cannot find any pretrains in {pretrain_path}  Try 'stanza.download(\"{language}\")' to get a default pretrain or use --wordvec_pretrain_file to specify a .pt file to use")
+    if len(pretrains) > 1:
+        default_pt = default_pretrain.get(language, None)
+        if default_pt is None:
+            raise FileNotFoundError(f"Too many pretrains to choose from in {pretrain_path}  No default pretrain is specified for language {language}  Must specify an exact path to a --wordvec_pretrain_file")
+        for pt_file in pretrains:
+            pt_name = os.path.split(pt_file)[1]
+            pt_name = os.path.splitext(pt_name)[0]
+            if pt_name == default_pt:
+                logger.info(f"Using default pretrain for language, found in {pt_file}  To use a different pretrain, specify --wordvec_pretrain_file")
+                return pt_file
+        raise FileNotFoundError(f"Too many pretrains to choose from in {pretrain_path}  Could not find default pt {default_pt} for language {language}  Must specify an exact path to a --wordvec_pretrain_file")
+    pt = pretrains[0]
+    logger.info(f"Using pretrain found in {pt}  To use a different pretrain, specify --wordvec_pretrain_file")
+    return pt
+
+def find_charlm_file(direction, language, charlm):
+    """
+    Return the path to the forward or backward charlm if it exists for the given package
+
+    If we can figure out the package, but can't find it anywhere, we try to download it
+    """
+    saved_path = 'saved_models/charlm/{}_{}_{}_charlm.pt'.format(language, charlm, direction)
+    if os.path.exists(saved_path):
+        logger.info(f'Using model {saved_path} for {direction} charlm')
+        return saved_path
+
+    resource_path = '{}/{}/{}_charlm/{}.pt'.format(DEFAULT_MODEL_DIR, language, direction, charlm)
+    if os.path.exists(resource_path):
+        logger.info(f'Using model {resource_path} for {direction} charlm')
+        return resource_path
+
+    try:
+        download(lang=language, package=None, processors={f"{direction}_charlm": charlm})
+        if os.path.exists(resource_path):
+            logger.info(f'Downloaded model, using model {resource_path} for {direction} charlm')
+            return resource_path
+    except ValueError as e:
+        # we're about to throw an error anyway
+        pass
+
+    raise FileNotFoundError(f"Cannot find {direction} charlm in either {saved_path} or {resource_path}  Attempted downloading {charlm} but that did not work")
+
+def build_charlm_args(language, charlm, base_args=True):
+    """
+    If specified, return forward and backward charlm args
+    """
+    if charlm:
+        forward = find_charlm_file('forward', language, charlm)
+        backward = find_charlm_file('backward', language, charlm)
+        char_args = ['--charlm_forward_file', forward,
+                     '--charlm_backward_file', backward]
+        if not base_args:
+            return char_args
+        return ['--charlm',
+                '--charlm_shorthand', f'{language}_{charlm}'] + char_args
+
+    return []
+
+def choose_charlm(language, dataset, charlm, language_charlms, dataset_charlms):
+    default_charlm = language_charlms.get(language, None)
+    specific_charlm = dataset_charlms.get(language, {}).get(dataset, None)
+
+    if charlm is None:
+        return None
+    elif charlm != "default":
+        return charlm
+    elif specific_charlm:
+        return specific_charlm
+    elif default_charlm:
+        return default_charlm
+    else:
+        return None
+

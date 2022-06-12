@@ -1,3 +1,13 @@
+"""
+Converts a directory of models organized by type into a directory organized by language.
+
+Also produces the resources.json file.
+
+For example, on the cluster, you can do this:
+
+python3 -m stanza.resources.prepare_resources --input_dir /u/nlp/software/stanza/models/current-models --output_dir /u/nlp/software/stanza/models/1.3.1b > resources.out 2>&1
+"""
+
 import json
 import argparse
 import os
@@ -5,6 +15,8 @@ from pathlib import Path
 import hashlib
 import shutil
 import zipfile
+
+from stanza.models.common.constant import lcode2lang
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -59,6 +71,7 @@ default_treebanks = {
   "cu": "proiel",
   "fro": "srcmf",
   "fa": "perdt",
+  "my": "ucsy",
   "pl": "pdb",
   "pt": "bosque",
   "ro": "rrt",
@@ -102,15 +115,22 @@ default_ners = {
   "af": "nchlt",
   "ar": "aqmar",
   "bg": "bsnlp19",
+  "da": "ddt",
   "de": "conll03",
   "en": "ontonotes",
   "es": "conll02",
+  "fa": "arman",
   "fi": "turku",
   "fr": "wikiner",
   "hu": "combined",
   "it": "fbk",
+  "my": "ucsy",
+  "nb": "norne",
   "nl": "conll02",
+  "nn": "norne",
   "ru": "wikiner",
+  "sv": "suc3shuffle",
+  "tr": "starlang",
   "uk": "languk",
   "vi": "vlsp",
   "zh-hans": "ontonotes",
@@ -121,14 +141,22 @@ default_charlms = {
   "af": "oscar",
   "ar": "ccwiki",
   "bg": "conll17",
+  "da": "oscar",
   "de": "newswiki",
   "en": "1billion",
   "es": "newswiki",
+  "fa": "conll17",
   "fi": "conll17",
   "fr": "newswiki",
   "it": "conll17",
+  "ja": "conll17",
+  "my": "oscar",
+  "nb": "conll17",
   "nl": "ccwiki",
   "ru": "newswiki",
+  "sv": "conll17",
+  "tr": "conll17",
+  "uk": "conll17",
   "vi": "conll17",
   "zh-hans": "gigaword"
 }
@@ -148,11 +176,11 @@ ner_charlms = {
     "radiology": "mimic",
     "s800": "pubmed",
   },
-  "uk": {
-    "languk": None,
-  },
   "hu": {
     "combined": None,
+  },
+  "nn": {
+    "norne": None,
   },
 }
 
@@ -166,12 +194,25 @@ default_sentiment = {
 
 # also, a few languages (very few, currently) have constituency parser models
 default_constituency = {
+  "da": "arboretum",
   "en": "wsj",
+  "it": "turin",
+  "ja": "alt",
+  "pt": "cintil",
+  "tr": "starlang",
+  "zh-hans": "ctb",
+}
+
+# an alternate tokenizer for languages which aren't trained from a base UD source
+default_tokenizer = {
+  "my": "alt",
 }
 
 allowed_empty_languages = [
   # we don't have a lot of Thai support yet
-  "th"
+  "th",
+  # only tokenize and NER for Myanmar right now (soon...)
+  "my",
 ]
 
 # map processor name to file ending
@@ -190,88 +231,6 @@ processor_to_ending = {
   "langid": "langid"
 }
 ending_to_processor = {j: i for i, j in processor_to_ending.items()}
-
-# add full language name to language code and add alias in resources
-lcode2lang = {
-    "af": "Afrikaans",
-    "grc": "Ancient_Greek",
-    "ar": "Arabic",
-    "hy": "Armenian",
-    "eu": "Basque",
-    "be": "Belarusian",
-    "br": "Breton",
-    "bg": "Bulgarian",
-    "bxr": "Buryat",
-    "ca": "Catalan",
-    "zh-hant": "Traditional_Chinese",
-    "lzh": "Classical_Chinese",
-    "cop": "Coptic",
-    "hr": "Croatian",
-    "cs": "Czech",
-    "da": "Danish",
-    "nl": "Dutch",
-    "en": "English",
-    "et": "Estonian",
-    "fo": "Faroese",
-    "fi": "Finnish",
-    "fr": "French",
-    "gl": "Galician",
-    "de": "German",
-    "got": "Gothic",
-    "el": "Greek",
-    "he": "Hebrew",
-    "hi": "Hindi",
-    "hu": "Hungarian",
-    "id": "Indonesian",
-    "is": "Icelandic",
-    "ga": "Irish",
-    "it": "Italian",
-    "ja": "Japanese",
-    "kk": "Kazakh",
-    "ko": "Korean",
-    "kmr": "Kurmanji",
-    "lt": "Lithuanian",
-    "olo": "Livvi",
-    "la": "Latin",
-    "lv": "Latvian",
-    "mt": "Maltese",
-    "mr": "Marathi",
-    "pcm": "Naija",
-    "sme": "North_Sami",
-    "nb": "Norwegian_Bokmaal",
-    "nn": "Norwegian_Nynorsk",
-    "cu": "Old_Church_Slavonic",
-    "fro": "Old_French",
-    "orv": "Old_East_Slavic",
-    "fa": "Persian",
-    "pl": "Polish",
-    "pt": "Portuguese",
-    "ro": "Romanian",
-    "ru": "Russian",
-    "sa": "Sanskrit",
-    "gd": "Scottish_Gaelic",
-    "sr": "Serbian",
-    "zh-hans": "Simplified_Chinese",
-    "sk": "Slovak",
-    "sl": "Slovenian",
-    "es": "Spanish",
-    "sv": "Swedish",
-    "swl": "Swedish_Sign_Language",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "th": "Thai",
-    "tr": "Turkish",
-    "qtd": "Turkish_German",
-    "uk": "Ukrainian",
-    "hsb": "Upper_Sorbian",
-    "ur": "Urdu",
-    "ug": "Uyghur",
-    "vi": "Vietnamese",
-    "cy": "Welsh",
-    "hyw": "Western_Armenian",
-    "wo": "Wolof"
-}
-
 
 def ensure_dir(dir):
     Path(dir).mkdir(parents=True, exist_ok=True)
@@ -304,6 +263,21 @@ def split_model_name(model):
         raise AssertionError(f"Could not find a processor type in {model}")
     lang, package = model.split('_', 1)
     return lang, package, processor
+
+def get_con_dependencies(lang, package):
+    # so far, this invariant is true:
+    # constituency models use the default pretrain and charlm for the language
+    pretrain_package = default_treebanks[lang]
+    dependencies = [{'model': 'pretrain', 'package': pretrain_package}]
+
+    # sometimes there is no charlm for a language that has constituency, though
+    charlm_package = default_charlms.get(lang, None)
+    if charlm_package is not None:
+        dependencies.append({'model': 'forward_charlm', 'package': charlm_package})
+        dependencies.append({'model': 'backward_charlm', 'package': charlm_package})
+
+    return dependencies
+
 
 def get_ner_dependencies(lang, package):
     if lang not in ner_charlms or package not in ner_charlms[lang]:
@@ -345,10 +319,7 @@ def process_dirs(args):
                 pretrain_package = default_treebanks[lang]
                 dependencies = [{'model': 'pretrain', 'package': pretrain_package}]
             elif processor == 'constituency':
-                # so far, this invariant is true:
-                # constituency models use the default pretrain for the language
-                pretrain_package = default_treebanks[lang]
-                dependencies = [{'model': 'pretrain', 'package': pretrain_package}]
+                dependencies = get_con_dependencies(lang, package)
             else:
                 dependencies = None
             # maintain resources
@@ -358,6 +329,7 @@ def process_dirs(args):
                 resources[lang][processor][package] = {'md5': md5, 'dependencies': dependencies}
             else:
                 resources[lang][processor][package] = {'md5': md5}
+    print("Processed initial model directories.  Writing preliminary resources.json")
     json.dump(resources, open(os.path.join(args.output_dir, 'resources.json'), 'w'), indent=2)
 
 
@@ -371,8 +343,11 @@ def process_defaults(args):
         ud_package = default_treebanks[lang]
         os.chdir(os.path.join(args.output_dir, lang))
         default_processors = {}
-        default_dependencies = {'pos': [{'model': 'pretrain', 'package': ud_package}],
-                                'depparse': [{'model': 'pretrain', 'package': ud_package}]}
+        if lang in allowed_empty_languages:
+            default_dependencies = {}
+        else:
+            default_dependencies = {'pos': [{'model': 'pretrain', 'package': ud_package}],
+                                    'depparse': [{'model': 'pretrain', 'package': ud_package}]}
 
         if lang in default_ners:
             ner_package = default_ners[lang]
@@ -391,8 +366,7 @@ def process_defaults(args):
             # All of the sentiment models created so far have used the default pretrain
             default_dependencies['sentiment'] = [{'model': 'pretrain', 'package': ud_package}]
         if lang in default_constituency:
-            # All of the constituency models created so far also use the default pretrain
-            default_dependencies['constituency'] = [{'model': 'pretrain', 'package': ud_package}]
+            default_dependencies['constituency'] = get_con_dependencies(lang, constituency_package)
 
         processors = ['tokenize', 'mwt', 'lemma', 'pos', 'depparse', 'pretrain']
         if lang in default_ners:
@@ -415,6 +389,7 @@ def process_defaults(args):
                 elif processor == 'sentiment': package = sentiment_package
                 elif processor == 'constituency': package = constituency_package
                 elif processor == 'langid': package = 'ud' 
+                elif processor == 'tokenize' and lang in default_tokenizer: package = default_tokenizer[lang]
                 else: package = ud_package
 
                 filename = os.path.join(args.output_dir, lang, processor, package + '.pt')
@@ -425,7 +400,7 @@ def process_defaults(args):
                         default_processors[processor] = package
                     zipf.write(os.path.join(processor, package + '.pt'))
                 elif lang in allowed_empty_languages:
-                    # we don't have a lot of Thai support yet
+                    # we don't have a lot of Thai or Myanmar support yet
                     pass
                 elif processor == 'lemma':
                     # a few languages use the identity lemmatizer -
@@ -443,6 +418,7 @@ def process_defaults(args):
         resources[lang]['default_dependencies'] = default_dependencies
         resources[lang]['default_md5'] = default_md5
 
+    print("Processed default model dependencies.  Writing resources.json")
     json.dump(resources, open(os.path.join(args.output_dir, 'resources.json'), 'w'), indent=2)
 
 
@@ -451,6 +427,8 @@ def process_lcode(args):
     resources_new = {}
     resources_new["multilingual"] = resources["multilingual"]
     for lang in resources:
+        if lang == 'multilingual':
+            continue
         if lang not in lcode2lang:
             print(lang + ' not found in lcode2lang!')
             continue
@@ -458,6 +436,7 @@ def process_lcode(args):
         resources[lang]['lang_name'] = lang_name
         resources_new[lang.lower()] = resources[lang.lower()]
         resources_new[lang_name.lower()] = {'alias': lang.lower()}
+    print("Processed lcode aliases.  Writing resources.json")
     json.dump(resources_new, open(os.path.join(args.output_dir, 'resources.json'), 'w'), indent=2)
 
 
@@ -466,6 +445,7 @@ def process_misc(args):
     resources['no'] = {'alias': 'nb'}
     resources['zh'] = {'alias': 'zh-hans'}
     resources['url'] = 'https://huggingface.co/stanfordnlp/stanza-{lang}/resolve/v{resources_version}/models/{filename}'
+    print("Finalized misc attributes.  Writing resources.json")
     json.dump(resources, open(os.path.join(args.output_dir, 'resources.json'), 'w'), indent=2)
 
 

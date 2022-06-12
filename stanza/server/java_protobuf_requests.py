@@ -156,22 +156,31 @@ class JavaProtobufContext(object):
     """
     A generic context for sending requests to a java program using protobufs in a subprocess
     """
-    def __init__(self, classpath, build_response, java_main):
+    def __init__(self, classpath, build_response, java_main, extra_args=None):
         self.classpath = resolve_classpath(classpath)
         self.build_response = build_response
         self.java_main = java_main
 
+        if extra_args is None:
+            extra_args = []
+        self.extra_args = extra_args
 
-    def __enter__(self):
-        self.pipe = subprocess.Popen(["java", "-cp", self.classpath, self.java_main, "-multiple"],
+    def open_pipe(self):
+        self.pipe = subprocess.Popen(["java", "-cp", self.classpath, self.java_main, "-multiple"] + self.extra_args,
                                      stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE)
-        return self
 
-    def __exit__(self, type, value, traceback):
+    def close_pipe(self):
         if self.pipe.poll() is None:
             self.pipe.stdin.write((0).to_bytes(4, 'big'))
             self.pipe.stdin.flush()
+
+    def __enter__(self):
+        self.open_pipe()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close_pipe()
 
     def process_request(self, request):
         text = request.SerializeToString()

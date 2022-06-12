@@ -23,13 +23,25 @@ from stanza.models.constituency.parse_transitions import TransitionScheme
 from stanza.models.constituency.parse_tree import Tree
 from stanza.models.constituency.tree_stack import TreeStack
 
+# default unary limit.  some treebanks may have longer chains (CTB, for example)
+UNARY_LIMIT = 4
+
 class BaseModel(ABC):
     """
     This base class defines abstract methods for manipulating a State.
 
     Applying transitions may change important metadata about a State
     such as the vectors associated with LSTM hidden states, for example.
+
+    The constructor forwards all unused arguments to other classes in the
+    constructor sequence, so put this before other classes such as nn.Module
     """
+    def __init__(self, transition_scheme, unary_limit, *args, **kwargs):
+        super().__init__(*args, **kwargs)  # forwards all unused arguments
+
+        self._transition_scheme = transition_scheme
+        self._unary_limit = unary_limit
+
     @abstractmethod
     def initial_word_queues(self, tagged_word_lists):
         """
@@ -118,36 +130,42 @@ class BaseModel(ABC):
         """
         return ("ROOT",)
 
-    @abstractmethod
+    def unary_limit(self):
+        """
+        Limit on the number of consecutive unary transitions
+        """
+        return self._unary_limit
+
+
     def transition_scheme(self):
         """
         Transition scheme used - see parse_transitions
         """
+        return self._transition_scheme
 
-    @abstractmethod
     def has_unary_transitions(self):
         """
         Whether or not this model uses unary transitions, based on transition_scheme
         """
+        return self._transition_scheme is TransitionScheme.TOP_DOWN_UNARY
 
-    @abstractmethod
     def is_top_down(self):
         """
         Whether or not this model is TOP_DOWN
         """
+        return not self._transition_scheme is TransitionScheme.IN_ORDER
 
 class SimpleModel(BaseModel):
     """
     This model allows pushing and popping with no extra data
     """
-    def __init__(self, transition_scheme=TransitionScheme.TOP_DOWN_UNARY):
-        self._transition_scheme = transition_scheme
+    def __init__(self, transition_scheme=TransitionScheme.TOP_DOWN_UNARY, unary_limit=UNARY_LIMIT):
+        super().__init__(transition_scheme=transition_scheme, unary_limit=unary_limit)
 
     def initial_word_queues(self, tagged_word_lists):
         word_queues = []
         for tagged_words in tagged_word_lists:
             word_queue = [tag_node for tag_node in tagged_words]
-            word_queue.reverse()
             word_queue.append(None)
             word_queues.append(word_queue)
         return word_queues
@@ -194,12 +212,3 @@ class SimpleModel(BaseModel):
 
     def get_top_transition(self, transitions):
         return transitions.value
-
-    def transition_scheme(self):
-        return self._transition_scheme
-
-    def has_unary_transitions(self):
-        return self._transition_scheme is TransitionScheme.TOP_DOWN_UNARY
-
-    def is_top_down(self):
-        return self._transition_scheme in (TransitionScheme.TOP_DOWN, TransitionScheme.TOP_DOWN_UNARY, TransitionScheme.TOP_DOWN_COMPOUND)
